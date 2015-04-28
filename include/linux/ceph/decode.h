@@ -217,6 +217,61 @@ static inline void ceph_encode_string(void **p, void *end,
 	*p += len;
 }
 
+/*
+ * version and length starting block encoders/decoders
+ */
+
+/* current code version (u8) + compat code version (u8) + len of struct (u32) */
+#define CEPH_ENCODING_START_BLK_LEN 6
+
+/**
+ * ceph_start_encoding - start encoding block
+ * @p: buffer to encode data in
+ * @curr_ver: current (code) version of the encoding
+ * @compat_ver: oldest code version that can decode it
+ * @len: length of data that will be encoded in buffer
+ */
+static inline void ceph_start_encoding(void **p, u8 curr_ver, u8 compat_ver,
+				       u32 len)
+{
+	ceph_encode_8(p, curr_ver);
+	ceph_encode_8(p, compat_ver);
+	ceph_encode_32(p, len);
+}
+
+/**
+ * ceph_start_decoding_compat - decode block with legacy support for older
+ * schemes
+ * @p: buffer to decode
+ * @end: end of decode buffer
+ * @curr_ver: current version of the encoding that the code supports/encode
+ * @compat_ver: oldest version that includes a __u8 compat version field
+ * @len_ver: oldest version that includes a __u32 length wrapper
+ * @len: buffer to return len of data in buffer
+ */
+static inline int ceph_start_decoding_compat(void **p, void *end, u8 curr_ver,
+					    u8 compat_ver, u8 len_ver, u32 *len)
+{
+	u8 struct_ver, struct_compat;
+
+	ceph_decode_8_safe(p, end, struct_ver, fail);
+	if (struct_ver >= compat_ver) {
+		ceph_decode_8_safe(p, end, struct_compat, fail);
+		if (curr_ver < struct_compat)
+			return -EINVAL;
+	}
+
+	if (struct_ver >= len_ver)
+		ceph_decode_32_safe(p, end, *len, fail);
+	else
+		*len = 0;
+
+	return 0;
+fail:
+	return -ERANGE;
+}
+
+
 #define ceph_encode_need(p, end, n, bad)			\
 	do {							\
 		if (!likely(ceph_has_room(p, end, n)))		\
