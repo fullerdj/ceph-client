@@ -428,6 +428,8 @@ static ssize_t rbd_remove_single_major(struct bus_type *bus, const char *buf,
 				       size_t count);
 static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth);
 static void rbd_spec_put(struct rbd_spec *spec);
+static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev);
+static void rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev);
 
 static int rbd_dev_id_to_minor(int dev_id)
 {
@@ -3091,14 +3093,19 @@ out_err:
 	obj_request_done_set(obj_request);
 }
 
-static int rbd_obj_notify_ack_sync(struct rbd_device *rbd_dev, u64 notify_id)
+static int rbd_obj_notify_ack_sync(struct rbd_device *rbd_dev, u64 notify_id,
+				   void *outbound, size_t outbound_size)
 {
 	struct rbd_obj_request *obj_request;
 	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+	struct page **pages = NULL;
+	void *p;
+	u32 page_count;
+	size_t ack_size;
 	int ret;
 
 	obj_request = rbd_obj_request_create(rbd_dev->header_name, 0, 0,
-							OBJ_REQUEST_NODATA);
+					     OBJ_REQUEST_NODATA);
 	if (!obj_request)
 		return -ENOMEM;
 
@@ -3108,33 +3115,51 @@ static int rbd_obj_notify_ack_sync(struct rbd_device *rbd_dev, u64 notify_id)
 	if (!obj_request->osd_req)
 		goto out;
 
+	ack_size = sizeof(notify_id) + sizeof(rbd_dev->watch_event->cookie);
+	page_count = (u32)calc_pages_for(0, ack_size + outbound_size);
+	pages = ceph_alloc_page_vector(page_count, GFP_NOIO);
+	if (IS_ERR(pages)) {
+		ret = PTR_ERR(pages);
+		goto out;
+	}
+	p = page_address(pages[0]);
+	ceph_encode_64(&p, notify_id);
+	ceph_encode_64(&p, rbd_dev->watch_event->cookie);
+	if (outbound_size)
+		ceph_copy_to_page_vector(pages, outbound,
+					 ack_size, outbound_size);
+
 	osd_req_op_watch_init(obj_request->osd_req, 0,
 			      CEPH_OSD_OP_NOTIFY_ACK, 0, notify_id);
+	osd_req_op_watch_request_data_pages(obj_request->osd_req, 0, pages,
+					    ack_size + outbound_size,
+					    0, false, false);
 	rbd_osd_req_format_read(obj_request);
 
 	ret = rbd_obj_request_submit(osdc, obj_request);
 	if (ret)
-		goto out;
+		goto free_pages;
 	ret = rbd_obj_request_wait(obj_request);
+
+free_pages:
+	ceph_release_page_vector(pages, page_count);
 out:
 	rbd_obj_request_put(obj_request);
 
 	return ret;
 }
 
-static void rbd_watch_cb(u64 ver, u64 notify_id, u8 opcode, s32 return_code,
-			 u64 notifier_gid, void *data, void *payload,
-			 u32 payload_len)
+static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
+			 void *data, size_t data_len)
 {
-	struct rbd_device *rbd_dev = (struct rbd_device *)data;
+	struct rbd_device *rbd_dev = (struct rbd_device *)arg;
 	int ret;
 
 	if (!rbd_dev)
 		return;
 
-	dout("%s: \"%s\" notify_id %llu opcode %u\n", __func__,
-		rbd_dev->header_name, (unsigned long long)notify_id,
-		(unsigned int)opcode);
+	dout("%s: \"%s\" notify_id %llu bl len %lu\n", __func__,
+	    rbd_dev->header_name, (unsigned long long)notify_id, data_len);
 
 	/*
 	 * Until adequate refresh error handling is in place, there is
@@ -3146,9 +3171,28 @@ static void rbd_watch_cb(u64 ver, u64 notify_id, u8 opcode, s32 return_code,
 	if (ret)
 		rbd_warn(rbd_dev, "refresh failed: %d", ret);
 
-	ret = rbd_obj_notify_ack_sync(rbd_dev, notify_id);
+	ret = rbd_obj_notify_ack_sync(rbd_dev, notify_id, NULL, 0);
 	if (ret)
 		rbd_warn(rbd_dev, "notify_ack ret %d", ret);
+}
+
+static void rbd_watch_error_cb(void *arg, u64 cookie, int err)
+{
+	struct rbd_device *rbd_dev = (struct rbd_device *)arg;
+	int ret;
+
+	rbd_warn(rbd_dev, "%s: watch error %d on cookie %llu\n",
+		 rbd_dev->header_name, err, cookie);
+
+	if (test_bit(RBD_DEV_FLAG_REMOVING, &rbd_dev->flags))
+		return;
+
+	/* reset watch */
+	rbd_dev_header_unwatch_sync(rbd_dev);
+	ret = rbd_dev_header_watch_sync(rbd_dev);
+	rbd_dev_refresh(rbd_dev);
+	if (ret)
+		rbd_warn(rbd_dev, "refresh failed: %d", ret);
 }
 
 /*
@@ -3218,13 +3262,14 @@ static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev)
 	rbd_assert(!rbd_dev->watch_event);
 	rbd_assert(!rbd_dev->watch_request);
 
-	ret = ceph_osdc_create_event(osdc, rbd_watch_cb, rbd_dev,
-				     &rbd_dev->watch_event);
+	ret = ceph_osdc_create_watch_event(osdc, rbd_watch_cb,
+					   rbd_watch_error_cb,
+					   rbd_dev, &rbd_dev->watch_event);
 	if (ret < 0)
 		return ret;
 
 	obj_request = rbd_obj_watch_request_helper(rbd_dev,
-						CEPH_OSD_WATCH_OP_LEGACY_WATCH);
+						CEPH_OSD_WATCH_OP_WATCH);
 	if (IS_ERR(obj_request)) {
 		ceph_osdc_cancel_event(rbd_dev->watch_event);
 		rbd_dev->watch_event = NULL;
