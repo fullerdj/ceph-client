@@ -395,6 +395,12 @@ extern struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *,
 				      u32 truncate_seq, u64 truncate_size,
 				      bool use_mempool);
 
+extern int ceph_osdc_cls_call(struct ceph_osd_client *osdc, int poolid,
+			      char *obj_name, char *class, char *method,
+			      int flags, struct page **req_data,
+			      size_t req_len, struct page **resp_data,
+			      size_t *resp_len);
+
 extern void ceph_osdc_get_request(struct ceph_osd_request *req);
 extern void ceph_osdc_put_request(struct ceph_osd_request *req);
 

@@ -1108,6 +1108,56 @@ fail:
 }
 EXPORT_SYMBOL(ceph_osdc_new_request);
 
+int ceph_osdc_cls_call(struct ceph_osd_client *osdc, int poolid,
+		       char *obj_name, char *class, char *method, int flags,
+		       struct page **req_data, size_t req_len,
+		       struct page **resp_data, size_t *resp_len)
+{
+	struct ceph_osd_request *osd_req;
+	int ret = -ENOMEM;
+
+	osd_req = ceph_osdc_alloc_request(osdc, NULL, 1, false, GFP_NOIO);
+	if (!osd_req)
+		return ret;
+
+	osd_req->r_flags = flags;
+	osd_req->r_base_oloc.pool = poolid;
+
+	ret = ceph_oid_aprintf(&osd_req->r_base_oid, GFP_NOIO, "%s", obj_name);
+	if (ret)
+		goto out;
+	
+	osd_req_op_cls_init(osd_req, 0, CEPH_OSD_OP_CALL, class, method);
+
+	if (req_data)
+		osd_req_op_cls_request_data_pages(osd_req, 0, req_data,
+						  req_len, 0, false, false);
+	if (resp_data)
+		osd_req_op_cls_response_data_pages(osd_req, 0, resp_data,
+						   PAGE_SIZE, 0, false, false);
+
+	ret = ceph_osdc_alloc_messages(osd_req, GFP_NOIO);
+	if (ret)
+		goto out;
+
+	ret = ceph_osdc_start_request(osdc, osd_req, false);
+	if (ret)
+		goto out;
+
+	ret = ceph_osdc_wait_request(osdc, osd_req);
+	if (ret < 0)
+		goto out;
+
+	if (resp_data)
+		*resp_len = osd_req->r_ops[0].outdata_len;
+
+	ret = osd_req->r_ops[0].rval;
+out:
+	ceph_osdc_put_request(osd_req);
+	return ret;
+}
+EXPORT_SYMBOL(ceph_osdc_cls_call);
+
 /*
  * We keep osd requests in an rbtree, sorted by ->r_tid.
  */
