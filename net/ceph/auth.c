@@ -94,6 +94,17 @@ int ceph_entity_name_encode(const char *name, void **p, void *end)
 	return 0;
 }
 
+int ceph_entity_name_decode(struct ceph_entity_name *name, void **p, void *end)
+{
+	ceph_decode_8_safe(p, end, name->type, bad);
+	ceph_decode_64_safe(p, end, name->num, bad);
+
+	return 0;
+
+bad:
+	return -ERANGE;
+}
+
 /*
  * Initiate protocol negotiation with monitor.  Include entity name
  * and list supported protocols.
