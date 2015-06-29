@@ -3,10 +3,173 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 
+#include <linux/ceph/cls_lock.h>
+#include <linux/ceph/auth.h>
 #include <linux/ceph/decode.h>
 #include <linux/ceph/messenger.h>
 #include <linux/ceph/msgpool.h>
 #include <linux/ceph/osd_client.h>
+
+static int __decode_locker(struct ceph_locker *locker, void **p, void *end)
+{
+	/*
+	 * struct cls_lock_get_info_reply {
+	 *     map {
+	 *         struct locker_id_t {
+	 *             struct entity_name_t {
+	 *                 __u8 type;
+	 *                 int64_t num;
+	 *             }
+	 *             string cookie;
+	 *         }
+	 *         struct locker_info_t {
+	 *             struct timespec ts;
+	 *			struct ceph_entity_addr addr;
+	 *			string description;
+	 *         }
+	 *     }
+	 *     int8_t lock_type;
+	 *     string tag;
+	 * }
+	 */
+	int ret;
+	u32 len;
+
+	/* locker_id_t */
+	ret = ceph_start_decoding_compat(p, end, 1, 1, 1, &len);
+	if (ret)
+		return ret;
+
+	ret = ceph_entity_name_decode(&locker->id.name, p, end);
+	if (ret)
+		return ret;
+
+	locker->id.cookie = ceph_extract_encoded_string(p, end,
+							&locker->id.cookie_len,
+							GFP_NOIO);
+	if (IS_ERR(locker->id.cookie))
+		return PTR_ERR(locker->id.cookie);
+
+	/* locker_info_t */
+	ret = ceph_start_decoding_compat(p, end, 1, 1, 1, &len);
+	if (ret)
+		goto free_cookie;
+
+	ceph_decode_timespec(&locker->info.ts, *p);
+	*p += sizeof(struct ceph_timespec);
+
+	ret = -ERANGE;
+	ceph_decode_copy_safe(p, end, &locker->info.addr,
+			      sizeof(locker->info.addr), free_cookie);
+	ceph_decode_addr(&locker->info.addr);
+
+	locker->info.desc = ceph_extract_encoded_string(p, end,
+							&locker->info.desc_len,
+							GFP_NOIO);
+	if (IS_ERR(locker->info.desc)) {
+		ret = PTR_ERR(locker->info.desc);
+		goto free_cookie;
+	}
+
+	return 0;
+
+free_cookie:
+	kfree(locker->id.cookie);
+	return ret;
+}
+
+int ceph_cls_lock_info(struct ceph_osd_client *osdc, int poolid, char *obj_name,
+		       char *lock_name, int *num_lockers,
+		       struct ceph_locker **lockers, u8 *lock_type, char **tag)
+{
+	int get_info_op_buf_size;
+	int name_len = strlen(lock_name);
+	struct page *get_info_page;
+	struct page *reply_page;
+	size_t reply_len;
+	int len;
+	u32 num;
+	void *p, *end;
+	int ret;
+	int i;
+
+	get_info_op_buf_size = name_len + sizeof(__le32) +
+			       CEPH_ENCODING_START_BLK_LEN;
+	if (get_info_op_buf_size > PAGE_SIZE)
+		return -ERANGE;
+
+	get_info_page = alloc_page(GFP_NOIO);
+	if (!get_info_page)
+		return -ENOMEM;
+
+	reply_page = alloc_page(GFP_NOIO);
+	if (!reply_page) {
+		__free_page(get_info_page);
+		return -ENOMEM;
+	}
+
+	p = page_address(get_info_page);
+	end = p + get_info_op_buf_size;
+
+	ceph_start_encoding(&p, 1, 1,
+			    get_info_op_buf_size - CEPH_ENCODING_START_BLK_LEN);
+
+	ceph_encode_string(&p, end, lock_name, name_len);
+
+	dout("%s: lock info for %s on object %s\n",
+	     __func__, lock_name, obj_name);
+
+	ret = ceph_osdc_cls_call(osdc, poolid, obj_name, "lock", "get_info",
+				 CEPH_OSD_FLAG_READ, &get_info_page,
+				 get_info_op_buf_size, &reply_page, &reply_len);
+
+	dout("%s: status %d\n", __func__, ret);
+	if (ret < 0)
+		goto err;
+
+	p = page_address(reply_page);
+	end = p + reply_len;
+
+	ret = ceph_start_decoding_compat(&p, end, 1, 1, 1, &len);
+	if (ret)
+		goto err;
+
+	ret = -ERANGE;
+	ceph_decode_32_safe(&p, end, num, err);
+	*num_lockers = (int)num;
+
+	*lockers = kcalloc(num, sizeof(**lockers), GFP_NOIO);
+	if (!*lockers) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	for (i = 0; i < num; i++) {
+		ret = __decode_locker(*lockers + i, &p, end);
+		if (ret)
+			goto free_lockers;
+	}
+
+	ceph_decode_8_safe(&p, end, *lock_type, free_lockers);
+	*tag = ceph_extract_encoded_string(&p, end, NULL, GFP_NOIO);
+
+	if (IS_ERR(tag)) {
+		ret = PTR_ERR(tag);
+		goto free_lockers;
+	}
+
+	ret = 0;
+
+err:
+	__free_page(get_info_page);
+	__free_page(reply_page);
+	return ret;
+
+free_lockers:
+	kfree(*lockers);
+	goto err;
+}
+EXPORT_SYMBOL(ceph_cls_lock_info);
 
 /**
  * ceph_cls_lock - grab rados lock for object
