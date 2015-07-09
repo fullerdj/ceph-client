@@ -32,6 +32,7 @@
 #include <linux/ceph/osd_client.h>
 #include <linux/ceph/mon_client.h>
 #include <linux/ceph/decode.h>
+#include <linux/ceph/cls_lock.h>
 #include <linux/parser.h>
 #include <linux/bsearch.h>
 
@@ -106,6 +107,10 @@ static int atomic_dec_return_safe(atomic_t *v)
 
 #define	BAD_SNAP_INDEX	U32_MAX		/* invalid index into snap array */
 
+#define RBD_LOCK_NAME	"rbd_lock"
+#define RBD_LOCK_TAG	"internal"
+#define RBD_LOCK_COOKIE_PREFIX	"auto"
+
 /* This allows a single page to hold an image name sent by OSD */
 #define RBD_IMAGE_NAME_LEN_MAX	(PAGE_SIZE - sizeof (__le32) - 1)
 #define RBD_IMAGE_ID_LEN_MAX	64
@@ -116,8 +121,10 @@ static int atomic_dec_return_safe(atomic_t *v)
 
 #define RBD_FEATURE_LAYERING	(1<<0)
 #define RBD_FEATURE_STRIPINGV2	(1<<1)
+#define RBD_FEATURE_EXCLUSIVE_LOCK (1<<2)
 #define RBD_FEATURES_ALL \
-	    (RBD_FEATURE_LAYERING | RBD_FEATURE_STRIPINGV2)
+	    (RBD_FEATURE_LAYERING | RBD_FEATURE_STRIPINGV2 | \
+	     RBD_FEATURE_EXCLUSIVE_LOCK)
 
 /* Features supported by this (client software) implementation. */
 
@@ -354,6 +361,8 @@ struct rbd_device {
 
 	struct ceph_osd_event   *watch_event;
 	struct rbd_obj_request	*watch_request;
+	enum rbd_lock_state	lock_state;
+	struct rw_semaphore	lock_rwsem;
 
 	struct rbd_spec		*parent_spec;
 	u64			parent_overlap;
@@ -430,6 +439,11 @@ static int rbd_dev_image_probe(struct rbd_device *rbd_dev, bool mapping);
 static void rbd_spec_put(struct rbd_spec *spec);
 static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev);
 static void rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev);
+
+static int rbd_unlock(struct rbd_device *rbd_dev);
+static int rbd_dev_v2_snap_context(struct rbd_device *rbd_dev);
+static struct rbd_spec *rbd_spec_get(struct rbd_spec *spec);
+static int rbd_try_lock(struct rbd_device *rbd_dev);
 
 static int rbd_dev_id_to_minor(int dev_id)
 {
@@ -1708,6 +1722,13 @@ rbd_img_request_op_type(struct rbd_img_request *img_request)
 		return OBJ_OP_DISCARD;
 	else
 		return OBJ_OP_READ;
+}
+
+static int rbd_lock_supported(struct rbd_device *rbd_dev)
+{
+	return (rbd_dev->header.features & RBD_FEATURE_EXCLUSIVE_LOCK) != 0 &&
+		!rbd_dev->mapping.read_only &&
+		rbd_dev->spec->snap_id == CEPH_NOSNAP;
 }
 
 static void
@@ -3142,21 +3163,394 @@ free_pages:
 	ceph_release_page_vector(pages, page_count);
 out:
 	rbd_obj_request_put(obj_request);
+	return ret;
+}
+
+static int __send_async_notify(struct rbd_device *rbd_dev, struct page **reply,
+			       size_t reply_len)
+{
+	struct ceph_osd_request *osd_req;
+	struct ceph_osd_event *notify_event;
+	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+	int ret;
+
+	osd_req = ceph_osdc_alloc_request(osdc, NULL, 1, false, GFP_NOIO);
+	if (!osd_req)
+		return -ENOMEM;
+
+	osd_req->r_flags = CEPH_OSD_FLAG_READ;
+	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+
+	ret = ceph_osdc_create_notify_event(osdc, &notify_event);
+	if (ret)
+		goto put_request;
+
+	ceph_oid_set_name(&osd_req->r_base_oid, rbd_dev->header_name);
+	osd_req_op_notify_init(osd_req, 0, CEPH_OSD_OP_NOTIFY,
+			       notify_event->cookie);
+	osd_req_op_notify_request_data_pages(osd_req, 0, reply, reply_len,
+					     0, false, false);
+	ceph_osdc_build_request(osd_req, 0, NULL, CEPH_NOSNAP, NULL);
+
+	ret = ceph_osdc_start_request(osdc, osd_req, false);
+	if (ret)
+		goto cancel_event;
+
+	dout("%s: cookie %llu tid %llu", __func__, notify_event->cookie,
+	     osd_req->r_tid);
+
+	ret = ceph_osdc_wait_request(osdc, osd_req);
+	if (ret)
+		goto cancel_event;
+
+	ceph_osdc_wait_event(osdc, notify_event);
+
+	ret = notify_event->notify.return_code;
+
+cancel_event:
+	ceph_osdc_cancel_event(notify_event);
+put_request:
+	ceph_osdc_put_request(osd_req);
+	return ret;
+}
+
+static int rbd_async_notify_ack(struct rbd_device *rbd_dev, u64 notify_id,
+			      int reply)
+{
+	void *reply_buf = NULL;
+	void *p;
+	u32 reply_len = 0;
+	int ret;
+
+	if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED) {
+		reply_len = sizeof(u32) + CEPH_ENCODING_START_BLK_LEN +
+			    sizeof(reply);
+		reply_buf = kmalloc(reply_len, GFP_NOIO);
+		if (!reply_buf)
+			return -ENOMEM;
+
+		p = reply_buf;
+		ceph_encode_32(&p, sizeof(reply) + CEPH_ENCODING_START_BLK_LEN);
+		ceph_start_encoding(&p, 1, 1, sizeof(reply));
+		ceph_encode_32(&p, reply);
+	}
+
+	ret = rbd_obj_notify_ack_sync(rbd_dev, notify_id, reply_buf, reply_len);
+
+	kfree(reply_buf);
 
 	return ret;
 }
 
-static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
-                        void *data, size_t data_len)
+static int rbd_async_notify(struct rbd_device *rbd_dev, void *payload,
+			  u32 payload_len)
 {
-	struct rbd_device *rbd_dev = (struct rbd_device *)arg;
+	struct page **pages;
+	size_t alloc_len;
+	size_t front_len;
+	u32 page_count;
+	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+	void *p;
+	int ret;
+	u32 notify_timeout = jiffies_to_msecs(osdc->client->options->
+					      osd_keepalive_timeout);
+
+	front_len = sizeof(u32) + sizeof(notify_timeout) +
+		    sizeof(payload_len) + CEPH_ENCODING_START_BLK_LEN;
+	alloc_len = payload_len + front_len;
+
+	page_count = calc_pages_for(0, alloc_len);
+
+	pages = ceph_alloc_page_vector(page_count, GFP_NOIO);
+	if (IS_ERR(pages))
+		return PTR_ERR(pages);
+
+	p = page_address(pages[0]);
+	ceph_encode_32(&p, 1); /* proto_ver */
+	ceph_encode_32(&p, notify_timeout); /* timeout */
+	ceph_encode_32(&p, payload_len + CEPH_ENCODING_START_BLK_LEN);
+	ceph_start_encoding(&p, 1, 1, payload_len);
+
+	ceph_copy_to_page_vector(pages, payload, front_len, payload_len);
+
+	ret = __send_async_notify(rbd_dev, pages, alloc_len);
+
+	ceph_release_page_vector(pages, page_count);
+	return ret;
+}
+
+static int __notify_simple_op(struct rbd_device *rbd_dev, enum rbd_notify_op op)
+{
+	void *reply;
+	u32 message_len;
+	void *p;
+	int ret;
+	u64 gid = rbd_dev->rbd_client->client->msgr.inst.name.num;
+	u64 handle = rbd_dev->watch_event->cookie;
+
+	/*
+	 * ClientId cid
+	 * {
+	 * 	u64 gid
+	 * 	u64 handle
+	 * }
+	 */
+
+	message_len = sizeof(u32) + sizeof(gid) + sizeof(handle);
+
+	reply = kmalloc(message_len, GFP_NOIO);
+	if (!reply)
+		return -ENOMEM;
+
+	p = reply;
+
+	ceph_encode_32(&p, op);
+	ceph_encode_64(&p, gid);
+	ceph_encode_64(&p, handle);
+
+	ret = rbd_async_notify(rbd_dev, reply, message_len);
+	kfree(reply);
+	return ret;
+}
+
+static int __notify_acquired_lock(struct rbd_device *rbd_dev)
+{
+	BUG_ON(rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED);
+
+	dout("notifying lock");
+	return __notify_simple_op(rbd_dev, RBD_NOTIFY_OP_ACQUIRED_LOCK);
+}
+
+static int __notify_released_lock(struct rbd_device *rbd_dev)
+{
+	BUG_ON(rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED);
+
+	dout("notify unlocking");
+	return __notify_simple_op(rbd_dev, RBD_NOTIFY_OP_RELEASED_LOCK);
+}
+
+static int __notify_request_lock(struct rbd_device *rbd_dev)
+{
+	rbd_assert(rbd_dev->lock_state == RBD_LOCK_STATE_NOT_LOCKED);
+
+	dout("notify requesting lock");
+	return __notify_simple_op(rbd_dev, RBD_NOTIFY_OP_REQUEST_LOCK);
+}
+
+static int __notify_async_complete(struct rbd_device *rbd_dev, u64 gid,
+				   u64 handle, u64 request_id, s32 result)
+{
+	void *reply;
+	u32 message_len;
+	void *p;
 	int ret;
 
-	if (!rbd_dev)
-		return;
+	/*
+	 * AsyncRequestId id
+	 * {
+	 * 	ClientId cid
+	 * 	{
+	 * 		u64 gid
+	 * 		u64 handle
+	 * 	}
+	 * 	u64 request_id
+	 * }
+	 * int result
+	 */
+	message_len = sizeof(u32) + sizeof(gid) + sizeof(handle) +
+		      sizeof(request_id) + sizeof(result);
+
+	reply = kmalloc(message_len, GFP_NOIO);
+	if (!reply)
+		return -ENOMEM;
+
+	p = reply;
+
+	ceph_encode_32(&p, RBD_NOTIFY_OP_ASYNC_COMPLETE);
+	ceph_encode_64(&p, gid);
+	ceph_encode_64(&p, handle);
+	ceph_encode_64(&p, request_id);
+	ceph_encode_32(&p, result); /* result */
+
+	ret = rbd_async_notify(rbd_dev, reply, message_len);
+	kfree(reply);
+	return ret;
+}
+
+static int rbd_handle_acquired_lock(struct rbd_device *rbd_dev, void *start,
+				    void *end)
+{
+	u64 gid;
+	u64 handle;
+	void *p;
+	int ret;
+
+	/* If someone else claims to have the lock, that could be bad. */
+	down_write(&rbd_dev->lock_rwsem);
+
+	if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = -ERANGE;
+	p = start;
+	ceph_decode_64_safe(&p, end, gid, out);
+	ceph_decode_64_safe(&p, end, handle, out);
+
+	if (gid != rbd_dev->rbd_client->client->msgr.inst.name.num &&
+	    handle != rbd_dev->watch_event->cookie) {
+		rbd_dev->lock_state = RBD_LOCK_STATE_NOT_LOCKED;
+		rbd_warn(rbd_dev, "another client locked this image!");
+		ret = -EDEADLK;
+	} else {
+		ret = 0;
+	}
+out:
+	up_write(&rbd_dev->lock_rwsem);
+	return ret;
+}
+
+static int rbd_handle_request_lock(struct rbd_device *rbd_dev, void *start,
+				   void *end)
+{
+	u64 gid;
+	u64 handle;
+	void *p;
+	int ret;
+	enum rbd_lock_state state;
+
+	down_read(&rbd_dev->lock_rwsem);
+	state = rbd_dev->lock_state;
+	up_read(&rbd_dev->lock_rwsem);
+
+	if (state != RBD_LOCK_STATE_LOCKED)
+		return 0;
+
+	p = start;
+	ceph_decode_64_safe(&p, end, gid, err);
+	ceph_decode_64_safe(&p, end, handle, err);
+
+	if (gid == rbd_dev->rbd_client->client->msgr.inst.name.num &&
+	    handle == rbd_dev->watch_event->cookie)
+		return 0;
+
+	ret = rbd_unlock(rbd_dev);
+	return ret;
+err:
+	return -ERANGE;
+}
+
+static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
+{
+	u64 size, gid, handle, request_id;
+	struct page *req_data;
+	size_t req_len = sizeof(size);
+	void *p;
+	int ret;
+
+	if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED) {
+		dout("%s skipping resize\n", __func__);
+		return 0;
+	}
+
+	p = start;
+	ceph_decode_64_safe(&p, end, size, err);
+	ceph_decode_64_safe(&p, end, gid, err);
+	ceph_decode_64_safe(&p, end, handle, err);
+	ceph_decode_64_safe(&p, end, request_id, err);
+
+	dout("got resize: size %llu gid %llu handle %llu request_id %llu\n",
+	     size, gid, handle, request_id);
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data)
+		return -ENOMEM;
+
+	p = page_address(req_data);
+	ceph_encode_64(&p, size);
+
+	ret = ceph_osd_op_cls_call(&rbd_dev->rbd_client->client->osdc,
+				   rbd_dev->spec->pool_id,
+				   rbd_dev->header_name, "rbd", "set_size",
+				   CEPH_OSD_FLAG_READ | CEPH_OSD_FLAG_WRITE |
+					CEPH_OSD_FLAG_ONDISK,
+				   &req_data, req_len, NULL, 0);
+	if (ret)
+		rbd_warn(rbd_dev, "error %d on resize", ret);
+	else
+		rbd_warn(rbd_dev, "resized to %llu", size);
+
+	__free_page(req_data);
+	__notify_async_complete(rbd_dev, gid, handle, request_id, ret);
+	return ret;
+err:
+	return -ERANGE;
+}
+
+static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
+			 void *data, size_t data_len)
+{
+	struct rbd_device *rbd_dev = (struct rbd_device *)arg;
+	void *p = data;
+	void *end = data + data_len;
+	u32 len;
+	u32 op;
+	int ret;
 
 	dout("%s: \"%s\" notify_id %llu bl len %lu\n", __func__,
 	    rbd_dev->header_name, (unsigned long long)notify_id, data_len);
+
+	if (data_len) {
+		ret = ceph_start_decoding_compat(&p, end, 2, 1, 1, &len);
+		if (ret)
+			goto err;
+		ceph_decode_32_safe(&p, end, op, err);
+	} else { /* legacy clients don't include a payload */
+		len = 0;
+		op = RBD_NOTIFY_OP_HEADER_UPDATE;
+	}
+
+	dout("%s got async request: len %u op %u", __func__, len, op);
+
+	switch(op) {
+	case RBD_NOTIFY_OP_ACQUIRED_LOCK:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		ret = rbd_handle_acquired_lock(rbd_dev, p, end);
+		if (ret)
+			rbd_warn(rbd_dev, "error on exclusive lock: %d", ret);
+		break;
+	case RBD_NOTIFY_OP_RELEASED_LOCK:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		break;
+	case RBD_NOTIFY_OP_REQUEST_LOCK:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		ret = rbd_handle_request_lock(rbd_dev, p, end);
+		if (ret)
+			rbd_warn(rbd_dev, "error handling lock req: %d", ret);
+		break;
+	case RBD_NOTIFY_OP_HEADER_UPDATE:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		ret = rbd_dev_refresh(rbd_dev);
+		if (ret)
+			rbd_warn(rbd_dev, "refresh failed: %d", ret);
+		break;
+	case RBD_NOTIFY_OP_ASYNC_COMPLETE:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		break;
+	case RBD_NOTIFY_OP_RESIZE:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		down_write(&rbd_dev->lock_rwsem);
+		ret = rbd_handle_resize(rbd_dev, p, end);
+		up_write(&rbd_dev->lock_rwsem);
+		if (ret)
+			rbd_warn(rbd_dev, "resize failed: %d", ret);
+		break;
+	default:
+		rbd_async_notify_ack(rbd_dev, notify_id, -ENOTSUPP);
+		rbd_warn(rbd_dev, "unsupported async operation %d", op);
+		break;
+	}
 
 	/*
 	 * Until adequate refresh error handling is in place, there is
@@ -3164,13 +3558,14 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 	 *
 	 * See http://tracker.ceph.com/issues/5040
 	 */
+	/*
 	ret = rbd_dev_refresh(rbd_dev);
 	if (ret)
 		rbd_warn(rbd_dev, "refresh failed: %d", ret);
-
-	ret = rbd_obj_notify_ack_sync(rbd_dev, notify_id, NULL, 0);
-	if (ret)
-		rbd_warn(rbd_dev, "notify_ack ret %d", ret);
+	*/
+	return;
+err:
+	rbd_warn(rbd_dev, "couldn't decode async op request");
 }
 
 static void rbd_watch_error_cb(void *arg, u64 cookie, int err)
@@ -3467,6 +3862,21 @@ static void rbd_queue_workfn(struct work_struct *work)
 	down_read(&rbd_dev->header_rwsem);
 	mapping_size = rbd_dev->mapping.size;
 	if (op_type != OBJ_OP_READ) {
+		down_read(&rbd_dev->lock_rwsem);
+		if (rbd_lock_supported(rbd_dev) &&
+		    rbd_dev->lock_state == RBD_LOCK_STATE_NOT_LOCKED)
+		{
+			up_read(&rbd_dev->lock_rwsem);
+			down_write(&rbd_dev->lock_rwsem);
+			result = rbd_try_lock(rbd_dev);
+			up_write(&rbd_dev->lock_rwsem);
+			if (result) {
+				up_read(&rbd_dev->header_rwsem);
+				goto err_rq;
+			}
+		} else {
+			up_read(&rbd_dev->lock_rwsem);
+		}
 		snapc = rbd_dev->header.snapc;
 		ceph_get_snap_context(snapc);
 	}
@@ -5463,6 +5873,179 @@ err_out_format:
 	return ret;
 }
 
+static int rbd_lock(struct rbd_device *rbd_dev)
+{
+	int ret;
+	char *cookie;
+
+	WARN_ON(rbd_dev->lock_state != RBD_LOCK_STATE_NOT_LOCKED);
+
+	cookie = kasprintf(GFP_NOIO, "%s %llu", RBD_LOCK_COOKIE_PREFIX,
+			   rbd_dev->watch_event->cookie);
+	if (!cookie)
+		return -ENOMEM;
+
+	ret = ceph_cls_lock(&rbd_dev->rbd_client->client->osdc,
+			    rbd_dev->spec->pool_id,
+			    rbd_dev->header_name, RBD_LOCK_NAME,
+			    CEPH_CLS_LOCK_EXCLUSIVE, cookie, RBD_LOCK_TAG,
+			    "", 0);
+
+	if (ret)
+		goto out;
+
+	rbd_dev->lock_state = RBD_LOCK_STATE_LOCKED;
+	__notify_acquired_lock(rbd_dev);
+
+out:
+	kfree(cookie);
+	return ret;
+}
+
+static int __find_watcher(struct rbd_device *rbd_dev,
+			  struct ceph_entity_addr target)
+{
+	struct ceph_watch_item *watchers;
+	u32 num_watchers = 0;
+	int ret;
+	int i;
+
+	ret = ceph_osd_op_list_watchers(&rbd_dev->rbd_client->client->osdc,
+					rbd_dev->spec->pool_id,
+					rbd_dev->header_name,
+					&watchers, &num_watchers);
+
+	if (ret)
+		return ret;
+
+	dout("%s: looking for watcher", __func__);
+
+	for (i = 0; i < num_watchers; i++) {
+		struct ceph_entity_addr *a = &watchers[i].addr;
+		dout("%s: cmp: %u %u / %u %u\n", __func__,
+		     a->type, a->nonce, target.type, target.nonce);
+		if (!memcmp(a, &target, sizeof(target))) {
+			ret = 1;
+			goto out;
+		}
+	}
+
+	ret = 0;
+
+out:
+	if (num_watchers)
+		kfree(watchers);
+	return ret;
+}
+
+static int rbd_try_lock(struct rbd_device *rbd_dev)
+{
+	int num_lockers = 0;
+	struct ceph_locker *lockers;
+	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+	struct ceph_mon_client *monc = &rbd_dev->rbd_client->client->monc;
+	u8 lock_type;
+	char *tag;
+	int ret;
+
+	WARN_ON(rbd_dev->lock_state != RBD_LOCK_STATE_NOT_LOCKED);
+start:
+	if (num_lockers) {
+		kfree(lockers);
+		kfree(tag);
+		num_lockers = 0;
+	}
+
+	ret = rbd_lock(rbd_dev);
+
+	if (ret != -EBUSY)
+		return ret;
+
+	ret = ceph_cls_lock_info(osdc, rbd_dev->spec->pool_id,
+				 rbd_dev->header_name, RBD_LOCK_NAME,
+				 &num_lockers, &lockers, &lock_type, &tag);
+
+	if (ret) {
+		rbd_warn(rbd_dev, "couldn't get exclusive lock info");
+		goto out;
+	}
+
+	if (num_lockers > 1) {
+		rbd_warn(rbd_dev, "lock state invalid");
+		ret = -EDEADLK;
+		goto out;
+	}
+
+	rbd_warn(rbd_dev, "locked by %s.%lld (tag %s)",
+		 ENTITY_NAME(lockers[0].id.name), tag);
+
+	ret = __find_watcher(rbd_dev, lockers[0].info.addr);
+	dout("%s, found watcher: %d\n", __func__, ret);
+
+	if (ret < 0) {
+		rbd_warn(rbd_dev, "error searching watchers for locker");
+		goto out;
+	} else if (ret == 0) {
+		rbd_warn(rbd_dev, "locker seems dead, breaking");
+
+		ret = ceph_monc_blacklist_add(monc, &lockers[0].info.addr);
+
+		if (ret) {
+			rbd_warn(rbd_dev, "blacklist of %s.%lld failed: %d",
+				 ENTITY_NAME(lockers[0].id.name), ret);
+			goto out;
+		}
+		ret = ceph_cls_break_lock(osdc, rbd_dev->spec->pool_id,
+					  rbd_dev->header_name, RBD_LOCK_NAME,
+					  lockers[0].id.name.type,
+					  lockers[0].id.name.num,
+					  lockers[0].id.cookie);
+		goto start;
+	} else {
+		ret = __notify_request_lock(rbd_dev);
+		if (ret == -ETIMEDOUT)
+			rbd_warn(rbd_dev, "no response from lock owner");
+		goto start;
+	}
+
+out:
+	if (num_lockers) {
+		kfree(lockers);
+		kfree(tag);
+	}
+
+	return ret;
+}
+
+static int rbd_unlock(struct rbd_device *rbd_dev)
+{
+	int ret;
+	char *cookie;
+
+	cookie = kasprintf(GFP_NOIO, "%s %llu", RBD_LOCK_COOKIE_PREFIX,
+			   rbd_dev->watch_event->cookie);
+
+	if (!cookie)
+		return -ENOMEM;
+
+	down_write(&rbd_dev->lock_rwsem);
+	ret = ceph_cls_unlock(&rbd_dev->rbd_client->client->osdc,
+			      rbd_dev->spec->pool_id, rbd_dev->header_name,
+			      RBD_LOCK_NAME, cookie);
+
+	if (ret) {
+		rbd_warn(rbd_dev, "couldn't release exclusive lock: %d", ret);
+	} else {
+		dout("%s: released lock\n", __func__);
+		rbd_dev->lock_state = RBD_LOCK_STATE_NOT_LOCKED;
+		__notify_released_lock(rbd_dev);
+	}
+
+	kfree(cookie);
+	up_write(&rbd_dev->lock_rwsem);
+	return ret;
+}
+
 static ssize_t do_rbd_add(struct bus_type *bus,
 			  const char *buf,
 			  size_t count)
@@ -5525,6 +6108,15 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 		read_only = true;
 	rbd_dev->mapping.read_only = read_only;
 
+	rbd_dev->lock_state = RBD_LOCK_STATE_NOT_LOCKED;
+	init_rwsem(&rbd_dev->lock_rwsem);
+
+	if (rbd_lock_supported(rbd_dev)) {
+		down_write(&rbd_dev->lock_rwsem);
+		rbd_try_lock(rbd_dev);
+		up_write(&rbd_dev->lock_rwsem);
+	}
+
 	rc = rbd_dev_device_setup(rbd_dev);
 	if (rc) {
 		/*
@@ -5532,6 +6124,11 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 		 * rbd_dev_image_release() without refactoring, see
 		 * commit 1f3ef78861ac.
 		 */
+		if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED) {
+			down_write(&rbd_dev->lock_rwsem);
+			rbd_unlock(rbd_dev);
+			up_write(&rbd_dev->lock_rwsem);
+		}
 		rbd_dev_header_unwatch_sync(rbd_dev);
 		rbd_dev_image_release(rbd_dev);
 		goto err_out_module;
@@ -5652,6 +6249,8 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 	if (ret < 0 || already)
 		return ret;
 
+	if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED)
+		rbd_unlock(rbd_dev);
 	rbd_dev_header_unwatch_sync(rbd_dev);
 	/*
 	 * flush remaining watch callbacks - these must be complete

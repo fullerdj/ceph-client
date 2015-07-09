@@ -77,5 +77,25 @@ struct rbd_image_header_ondisk {
 	struct rbd_image_snap_ondisk snaps[0];
 } __attribute__((packed));
 
+enum rbd_notify_op {
+	RBD_NOTIFY_OP_ACQUIRED_LOCK      = 0,
+	RBD_NOTIFY_OP_RELEASED_LOCK      = 1,
+	RBD_NOTIFY_OP_REQUEST_LOCK       = 2,
+	RBD_NOTIFY_OP_HEADER_UPDATE      = 3,
+	RBD_NOTIFY_OP_ASYNC_PROGRESS     = 4,
+	RBD_NOTIFY_OP_ASYNC_COMPLETE     = 5,
+	RBD_NOTIFY_OP_FLATTEN            = 6,
+	RBD_NOTIFY_OP_RESIZE             = 7,
+	RBD_NOTIFY_OP_SNAP_CREATE        = 8,
+	RBD_NOTIFY_OP_SNAP_REMOVE        = 9,
+	RBD_NOTIFY_OP_REBUILD_OBJECT_MAP = 10,
+};
+
+enum rbd_lock_state {
+	RBD_LOCK_STATE_NOT_LOCKED,
+	RBD_LOCK_STATE_LOCKED,
+};
+
+enum rbd_watch_state {RBD_WATCH_STATE_FOO};
 
 #endif
