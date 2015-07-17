@@ -291,6 +291,23 @@ void osd_req_op_notify_request_data_pages(struct ceph_osd_request *osd_req,
 }
 EXPORT_SYMBOL(osd_req_op_notify_request_data_pages);
 
+void osd_req_op_list_watchers_response_data_pages(
+					       struct ceph_osd_request *osd_req,
+					       unsigned int which,
+					       struct page **pages,
+					       u64 length, u32 alignment,
+					       bool pages_from_pool,
+					       bool own_pages)
+{
+	struct ceph_osd_data *osd_data;
+
+	osd_data = osd_req_op_data(osd_req, which,
+				   list_watchers, response_data);
+	ceph_osd_data_pages_init(osd_data, pages, length, alignment,
+				 pages_from_pool, own_pages);
+}
+EXPORT_SYMBOL(osd_req_op_list_watchers_response_data_pages);
+
 static u64 ceph_osd_data_length(struct ceph_osd_data *osd_data)
 {
 	switch (osd_data->type) {
@@ -833,6 +850,10 @@ static u64 osd_req_encode_op(struct ceph_osd_request *req,
 		dst->watch.op = src->watch.op;
 		dst->watch.gen = cpu_to_le32(src->watch.gen);
 		break;
+	case CEPH_OSD_OP_LIST_WATCHERS:
+		osd_data = &src->list_watchers.response_data;
+		ceph_osdc_msg_data_add(req->r_reply, osd_data);
+		break;
 	case CEPH_OSD_OP_SETALLOCHINT:
 		dst->alloc_hint.expected_object_size =
 		    cpu_to_le64(src->alloc_hint.expected_object_size);
@@ -866,6 +887,123 @@ static u64 osd_req_encode_op(struct ceph_osd_request *req,
 
 	return request_data_len;
 }
+
+static int __decode_watcher(void **p, void *end, struct ceph_watch_item *item)
+{
+	/*
+	 * obj_list_watch_response_t {
+	 *     list<watch_item_t> {
+	 *         entity_name_t {
+	 *             __u8 type;
+	 *             int64_t num;
+	 *         }
+	 *         uint64_t cookie;
+	 *         uint32_t timeout_seconds;
+	 *         entity_addr_t {
+	 *             __u32 type;
+	 *             __u32 nonce;
+	 *             sockaddr_storage addr;
+	 *         }
+	 *     }
+	 * }
+	 */
+
+	int ret;
+	u32 len;
+
+	ret = ceph_start_decoding_compat(p, end, 2, 1, 1, &len);
+	if (ret)
+		return ret;
+
+	ret = ceph_entity_name_decode(&item->name, p, end);
+	if (ret)
+		return ret;
+
+	dout("found watcher %s.%llu\n", ENTITY_NAME(item->name));
+
+	/* skip cookie and timeout */
+	ceph_decode_64_safe(p, end, item->cookie, err);
+	ceph_decode_32_safe(p, end, item->timeout_seconds, err);
+
+	ceph_decode_copy_safe(p, end, &item->addr,
+			      sizeof(struct ceph_entity_addr), err);
+	ceph_decode_addr(&item->addr);
+	return 0;
+err:
+	return -ERANGE;
+}
+
+int ceph_osd_op_list_watchers(struct ceph_osd_client *osdc, int poolid,
+			      char *obj_name, struct ceph_watch_item **watchers,
+			      u32 *num_watchers)
+{
+	struct ceph_osd_request *osd_req;
+	struct page *pg;
+	int ret;
+	void *p;
+	void *end;
+	u32 len;
+	int i;
+
+	pg = alloc_page(GFP_NOIO);
+	if (!pg)
+		return -ENOMEM;
+
+	osd_req = ceph_osdc_alloc_request(osdc, NULL, 1, false, GFP_NOIO);
+	if (!osd_req) {
+		__free_page(pg);
+		return -ENOMEM;
+	}
+
+	osd_req->r_flags = CEPH_OSD_FLAG_READ;
+	osd_req->r_base_oloc.pool = poolid;
+	ceph_oid_set_name(&osd_req->r_base_oid, obj_name);
+
+	osd_req_op_init(osd_req, 0, CEPH_OSD_OP_LIST_WATCHERS, 0);
+	osd_req_op_list_watchers_response_data_pages(osd_req, 0, &pg,
+						     PAGE_SIZE,
+						     0, false, false);
+	ceph_osdc_build_request(osd_req, 0, NULL, CEPH_NOSNAP, NULL);
+
+	ret = ceph_osdc_start_request(osdc, osd_req, false);
+	if (ret)
+		goto out;
+
+	ret = ceph_osdc_wait_request(osdc, osd_req);
+	if (ret < 0)
+		goto out;
+
+	p = page_address(pg);
+	end = p + osd_req->r_ops[0].outdata_len;
+	ret = ceph_start_decoding_compat(&p, end, 1, 1, 1, &len);
+	if (ret)
+		goto out;
+
+	ceph_decode_32_safe(&p, end, *num_watchers, err);
+
+	*watchers = kcalloc(*num_watchers, sizeof(**watchers), GFP_NOIO);
+	if (!watchers) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < *num_watchers; i++) {
+		ret = __decode_watcher(&p, end, *watchers + i);
+		if (ret < 0) {
+			kfree(*watchers);
+			goto out;
+		}
+	}
+
+out:
+	ceph_osdc_put_request(osd_req);
+	__free_page(pg);
+	return ret;
+err:
+	ret = -ERANGE;
+	goto out;
+}
+EXPORT_SYMBOL(ceph_osd_op_list_watchers);
 
 /*
  * build new request AND message, calculate layout, and adjust file
