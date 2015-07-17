@@ -277,6 +277,20 @@ void osd_req_op_notify_request_data_pagelist(
 }
 EXPORT_SYMBOL(osd_req_op_notify_request_data_pagelist);
 
+void osd_req_op_notify_request_data_pages(struct ceph_osd_request *osd_req,
+					  unsigned int which,
+					  struct page **pages,
+					  u64 length, u32 alignment,
+					  bool pages_from_pool, bool own_pages)
+{
+	struct ceph_osd_data *osd_data;
+
+	osd_data = osd_req_op_data(osd_req, which, notify, request_data);
+	ceph_osd_data_pages_init(osd_data, pages, length, alignment,
+				 pages_from_pool, own_pages);
+}
+EXPORT_SYMBOL(osd_req_op_notify_request_data_pages);
+
 static u64 ceph_osd_data_length(struct ceph_osd_data *osd_data)
 {
 	switch (osd_data->type) {

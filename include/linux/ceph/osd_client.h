@@ -329,6 +329,11 @@ void osd_req_op_watch_request_data_pages(struct ceph_osd_request *osd_req,
 extern void osd_req_op_notify_request_data_pagelist(struct ceph_osd_request *,
 					unsigned int which,
 					struct ceph_pagelist *pagelist);
+void osd_req_op_notify_request_data_pages(struct ceph_osd_request *osd_req,
+					  unsigned int which,
+					  struct page **pages,
+					  u64 length, u32 alignment,
+					  bool pages_from_pool, bool own_pages);
 extern void osd_req_op_notify_init(struct ceph_osd_request *osd_req,
 				   unsigned int which, u16 opcode, u64 cookie);
 extern void osd_req_op_cls_init(struct ceph_osd_request *osd_req,
