@@ -115,6 +115,9 @@ struct ceph_osd_req_op {
 			struct ceph_osd_data request_data;
 		} watch;
 		struct {
+			struct ceph_osd_data response_data;
+		} list_watchers;
+		struct {
 			u64 cookie;
 			struct ceph_osd_data request_data;
 		} notify;
@@ -218,6 +221,13 @@ struct ceph_osd_event_work {
 	u64 notifier_gid;
 	void *payload;
 	u32 payload_len;
+};
+
+struct ceph_watch_item {
+	struct ceph_entity_name name;
+	u64 cookie;
+	u32 timeout_seconds;
+	struct ceph_entity_addr addr;
 };
 
 struct ceph_osd_client {
@@ -334,6 +344,13 @@ void osd_req_op_notify_request_data_pages(struct ceph_osd_request *osd_req,
 					  struct page **pages,
 					  u64 length, u32 alignment,
 					  bool pages_from_pool, bool own_pages);
+void osd_req_op_list_watchers_response_data_pages(
+					       struct ceph_osd_request *osd_req,
+					       unsigned int which,
+					       struct page **pages,
+					       u64 length, u32 alignment,
+					       bool pages_from_pool,
+					       bool own_pages);
 extern void osd_req_op_notify_init(struct ceph_osd_request *osd_req,
 				   unsigned int which, u16 opcode, u64 cookie);
 extern void osd_req_op_cls_init(struct ceph_osd_request *osd_req,
@@ -360,6 +377,11 @@ extern void ceph_osdc_build_request(struct ceph_osd_request *req, u64 off,
 				    struct ceph_snap_context *snapc,
 				    u64 snap_id,
 				    struct timespec *mtime);
+
+extern int ceph_osd_op_list_watchers(struct ceph_osd_client *osdc, int poolid,
+				     char *obj_name,
+				     struct ceph_watch_item **watchers,
+				     u32 *num_watchers);
 
 extern struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *,
 				      struct ceph_file_layout *layout,
