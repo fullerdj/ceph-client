@@ -470,7 +470,7 @@ out:
 }
 
 /*
- * generic requests (currently statfs, mon_get_version)
+ * generic requests (e.g., statfs, poolop)
  */
 DEFINE_RB_FUNCS(generic_request, struct ceph_mon_generic_request, tid, node)
 
@@ -659,7 +659,7 @@ static void handle_statfs_reply(struct ceph_mon_client *monc,
 	return;
 
 bad:
-	pr_err("corrupt statfs reply, tid %llu\n", tid);
+	pr_err("corrupt generic reply, tid %llu\n", tid);
 	ceph_msg_dump(msg);
 }
 
@@ -737,7 +737,7 @@ static void handle_get_version_reply(struct ceph_mon_client *monc,
 	return;
 
 bad:
-	pr_err("corrupt mon_get_version reply, tid %llu\n", tid);
+	pr_err("corrupt mon_get_version reply\n");
 	ceph_msg_dump(msg);
 }
 
@@ -944,6 +944,130 @@ static void ceph_monc_handle_cmd_ack(struct ceph_mon_client *monc,
 
 out:
 	kfree(rs);
+}
+
+/*
+ * pool ops
+ */
+static int get_poolop_reply_buf(const char *src, size_t src_len,
+				char *dst, size_t dst_len)
+{
+	u32 buf_len;
+
+	if (src_len != sizeof(u32) + dst_len)
+		return -EINVAL;
+
+	buf_len = le32_to_cpu(*(__le32 *)src);
+	if (buf_len != dst_len)
+		return -EINVAL;
+
+	memcpy(dst, src + sizeof(u32), dst_len);
+	return 0;
+}
+
+static void handle_poolop_reply(struct ceph_mon_client *monc,
+				struct ceph_msg *msg)
+{
+	struct ceph_mon_generic_request *req;
+	struct ceph_mon_poolop_reply *reply = msg->front.iov_base;
+	u64 tid = le64_to_cpu(msg->hdr.tid);
+
+	if (msg->front.iov_len < sizeof(*reply))
+		goto bad;
+	dout("handle_poolop_reply %p tid %llu\n", msg, tid);
+
+	mutex_lock(&monc->mutex);
+	req = lookup_generic_request(&monc->generic_request_tree, tid);
+	if (req) {
+		if (req->u.poolop.buf_len &&
+		    get_poolop_reply_buf(msg->front.iov_base + sizeof(*reply),
+					 msg->front.iov_len - sizeof(*reply),
+					 req->u.poolop.buf,
+					 req->u.poolop.buf_len) < 0) {
+			mutex_unlock(&monc->mutex);
+			goto bad;
+		}
+		req->result = le32_to_cpu(reply->reply_code);
+		__finish_generic_request(req);
+	}
+	mutex_unlock(&monc->mutex);
+	if (req) {
+		complete_generic_request(req);
+	}
+	return;
+
+bad:
+	pr_err("corrupt generic reply, tid %llu\n", tid);
+	ceph_msg_dump(msg);
+}
+
+/*
+ * Do a synchronous pool op.
+ */
+static int do_poolop(struct ceph_mon_client *monc, u32 op,
+		     u32 pool, u64 snapid,
+		     char *buf, int len)
+{
+	struct ceph_mon_generic_request *req;
+	struct ceph_mon_poolop *h;
+	int err;
+
+	req = alloc_generic_request(monc, GFP_NOFS);
+	if (!req)
+		return -ENOMEM;
+
+	req->u.poolop.buf = buf;
+	req->u.poolop.buf_len = len;
+
+	err = -ENOMEM;
+	req->request = ceph_msg_new(CEPH_MSG_POOLOP, sizeof(*h), GFP_NOFS,
+				    true);
+	if (!req->request)
+		goto out;
+	req->reply = ceph_msg_new(CEPH_MSG_POOLOP_REPLY, 1024, GFP_NOFS,
+				  true);
+	if (!req->reply)
+		goto out;
+
+	mutex_lock(&monc->mutex);
+	register_generic_request(req);
+	/* fill out request */
+	req->request->hdr.version = cpu_to_le16(2);
+	h = req->request->front.iov_base;
+	h->monhdr.have_version = 0;
+	h->monhdr.session_mon = cpu_to_le16(-1);
+	h->monhdr.session_mon_tid = 0;
+	h->fsid = monc->monmap->fsid;
+	h->pool = cpu_to_le32(pool);
+	h->op = cpu_to_le32(op);
+	h->auid = 0;
+	h->snapid = cpu_to_le64(snapid);
+	h->name_len = 0;
+	send_generic_request(monc, req);
+	mutex_unlock(&monc->mutex);
+
+	err = wait_generic_request(req);
+
+out:
+	put_generic_request(req);
+	return err;
+}
+
+int ceph_monc_create_snapid(struct ceph_mon_client *monc,
+			    u32 pool, u64 *snapid)
+{
+	return do_poolop(monc,  POOL_OP_CREATE_UNMANAGED_SNAP,
+				   pool, 0, (char *)snapid, sizeof(*snapid));
+
+}
+EXPORT_SYMBOL(ceph_monc_create_snapid);
+
+int ceph_monc_delete_snapid(struct ceph_mon_client *monc,
+			    u32 pool, u64 snapid)
+{
+	return do_poolop(monc,  POOL_OP_CREATE_UNMANAGED_SNAP,
+				   pool, snapid, NULL, 0);
+
 }
 
 /*
@@ -1248,6 +1372,10 @@ static void dispatch(struct ceph_connection *con, struct ceph_msg *msg)
 		handle_get_version_reply(monc, msg);
 		break;
 
+	case CEPH_MSG_POOLOP_REPLY:
+		handle_poolop_reply(monc, msg);
+		break;
+
 	case CEPH_MSG_MON_MAP:
 		ceph_monc_handle_map(monc, msg);
 		break;
@@ -1290,6 +1418,7 @@ static struct ceph_msg *mon_alloc_msg(struct ceph_connection *con,
 	case CEPH_MSG_MON_SUBSCRIBE_ACK:
 		m = ceph_msg_get(monc->m_subscribe_ack);
 		break;
+	case CEPH_MSG_POOLOP_REPLY:
 	case CEPH_MSG_STATFS_REPLY:
 	case CEPH_MSG_MON_COMMAND_ACK:
 		return get_generic_reply(con, hdr, skip);

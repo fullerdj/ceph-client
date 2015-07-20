@@ -42,7 +42,7 @@ struct ceph_mon_request {
 typedef void (*ceph_monc_callback_t)(struct ceph_mon_generic_request *);
 
 /*
- * ceph_mon_generic_request is being used for the statfs and
+ * ceph_mon_generic_request is being used for the statfs, poolop and
  * mon_get_version requests which are being done a bit differently
  * because we need to get data back to the caller
  */
@@ -52,7 +52,7 @@ struct ceph_mon_generic_request {
 	u64 tid;
 	struct rb_node node;
 	int result;
-
+	
 	struct completion completion;
 	ceph_monc_callback_t complete_cb;
 	u64 private_data;          /* r_tid/linger_id */
@@ -63,6 +63,10 @@ struct ceph_mon_generic_request {
 	union {
 		struct ceph_statfs *st;
 		u64 newest;
+		struct {
+			char *buf;
+		        int buf_len;
+		} poolop;
 	} u;
 };
 
@@ -154,4 +158,9 @@ extern int ceph_monc_validate_auth(struct ceph_mon_client *monc);
 
 extern int ceph_monc_blacklist_add(struct ceph_mon_client *monc,
 				   struct ceph_entity_addr *target);
+extern int ceph_monc_create_snapid(struct ceph_mon_client *monc,
+				   u32 pool, u64 *snapid);
+
+extern int ceph_monc_delete_snapid(struct ceph_mon_client *monc,
+				   u32 pool, u64 snapid);
 #endif
