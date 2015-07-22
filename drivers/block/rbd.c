@@ -439,6 +439,7 @@ static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth);
 static void rbd_spec_put(struct rbd_spec *spec);
 
 static int rbd_unlock(struct rbd_device *rbd_dev);
+static u64 rbd_snap_id_by_name(struct rbd_device *rbd_dev, const char *name);
 static int rbd_dev_v2_snap_context(struct rbd_device *rbd_dev);
 static struct rbd_spec *rbd_spec_get(struct rbd_spec *spec);
 static int rbd_try_lock(struct rbd_device *rbd_dev);
@@ -3375,6 +3376,134 @@ err:
 	return -ERANGE;
 }
 
+static int rbd_handle_snap_create(struct rbd_device *rbd_dev, void *start,
+				  void *end)
+{
+	void *p;
+	char *snap_name;
+	size_t name_len;
+	size_t msg_len;
+	struct page *req_data;
+	u64 snapid;
+	int ret;
+
+	if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED)
+		return 0;
+
+	p = start;
+	snap_name = ceph_extract_encoded_string(&p, end, &name_len, GFP_NOIO);
+	if (IS_ERR(snap_name))
+		return PTR_ERR(snap_name);
+
+	snapid = rbd_snap_id_by_name(rbd_dev, snap_name);
+	if (snapid != CEPH_NOSNAP) {
+		ret = -EEXIST;
+		goto out;
+	}
+
+	ret = ceph_monc_create_snapid(&rbd_dev->rbd_client->client->monc,
+				      rbd_dev->spec->pool_id, &snapid);
+
+	dout("%s: ceph_monc_create_snapid returned %d\n", __func__, ret);
+	if (ret < 0)
+		goto out;
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = -ERANGE;
+	p = page_address(req_data);
+	end = p + PAGE_SIZE;
+	msg_len = name_len + sizeof(u32) + sizeof(snapid);
+	ceph_encode_need(&p, end, msg_len, free_page);
+	ceph_encode_string(&p, end, snap_name, name_len);
+	ceph_encode_64(&p, snapid);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->header_oid.name,
+				 "rbd", "snapshot_add",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 &req_data, msg_len, NULL, 0);
+
+	if (ret < 0)
+		goto free_page;
+
+	ret = rbd_dev_v2_snap_context(rbd_dev);
+
+	if (!ret)
+		rbd_warn(rbd_dev, "created snapshot %s@%s",
+			 rbd_dev->spec->image_name, snap_name);
+free_page:
+	__free_page(req_data);
+out:
+	kfree(snap_name);
+	return ret;
+}
+
+static int rbd_handle_snap_remove(struct rbd_device *rbd_dev, void *start,
+				  void *end)
+{
+	void *p;
+	char *snap_name;
+	struct page *req_data;
+	u64 snapid;
+	int ret;
+
+	if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED)
+		return 0;
+
+	p = start;
+	snap_name = ceph_extract_encoded_string(&p, end, NULL, GFP_NOIO);
+	if (IS_ERR(snap_name))
+		return PTR_ERR(snap_name);
+
+	dout("%s: remove snap %s\n", __func__, snap_name);
+
+	snapid = rbd_snap_id_by_name(rbd_dev, snap_name);
+	if (snapid == CEPH_NOSNAP) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	p = page_address(req_data);
+	ceph_encode_64(&p, snapid);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->header_oid.name,
+				 "rbd", "snapshot_remove",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 &req_data, sizeof(snapid), NULL, 0);
+
+	if (ret < 0)
+		goto free_page;
+
+	ret = ceph_monc_delete_snapid(&rbd_dev->rbd_client->client->monc,
+				      rbd_dev->spec->pool_id, snapid);
+	if (ret)
+		goto free_page;
+
+	ret = rbd_dev_v2_snap_context(rbd_dev);
+	if (!ret)
+		rbd_warn(rbd_dev, "deleted snapshot %s\n", snap_name);
+
+free_page:
+	__free_page(req_data);
+out:
+	kfree(snap_name);
+	return ret;
+}
+
 static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 			 void *data, size_t data_len)
 {
@@ -3432,6 +3561,22 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 		ret = rbd_handle_resize(rbd_dev, p, end);
 		if (ret)
 			rbd_warn(rbd_dev, "resize failed: %d", ret);
+		break;
+	case RBD_NOTIFY_OP_SNAP_CREATE:
+		down_write(&rbd_dev->lock_rwsem);
+		ret = rbd_handle_snap_create(rbd_dev, p, end);
+		up_write(&rbd_dev->lock_rwsem);
+		if (ret)
+			rbd_warn(rbd_dev, "snap create failed: %d", ret);
+		rbd_async_notify_ack(rbd_dev, notify_id, ret);
+		break;
+	case RBD_NOTIFY_OP_SNAP_REMOVE:
+		down_write(&rbd_dev->lock_rwsem);
+		ret = rbd_handle_snap_remove(rbd_dev, p, end);
+		up_write(&rbd_dev->lock_rwsem);
+		if (ret)
+			rbd_warn(rbd_dev, "snap remove failed: %d", ret);
+		rbd_async_notify_ack(rbd_dev, notify_id, ret);
 		break;
 	default:
 		rbd_async_notify_ack(rbd_dev, notify_id, -ENOTSUPP);
