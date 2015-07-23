@@ -827,6 +827,221 @@ bad:
 	ceph_msg_dump(msg);
 }
 
+static struct ceph_mon_cmd_req *__lookup_mon_cmd(struct ceph_mon_client *monc,
+						 u64 tid)
+{
+	struct ceph_mon_cmd_req *req;
+	struct rb_node *n = monc->mon_cmd_tree.rb_node;
+
+	while (n) {
+		req = rb_entry(n, struct ceph_mon_cmd_req, node);
+		if (tid < req->tid)
+			n = n->rb_left;
+		else if (tid > req->tid)
+			n = n->rb_right;
+		else
+			return req;
+	}
+	return NULL;
+}
+
+static void __insert_mon_cmd(struct ceph_mon_client *monc,
+			     struct ceph_mon_cmd_req *new)
+{
+	struct rb_node **p = &monc->mon_cmd_tree.rb_node;
+	struct rb_node *parent = NULL;
+	struct ceph_mon_cmd_req *req = NULL;
+
+	while (*p) {
+		parent = *p;
+		req = rb_entry(parent, struct ceph_mon_cmd_req, node);
+		if (new->tid < req->tid)
+			p = &(*p)->rb_left;
+		else if (new->tid > req->tid)
+			p = &(*p)->rb_right;
+		else
+			BUG();
+	}
+
+	rb_link_node(&new->node, parent, p);
+	rb_insert_color(&new->node, &monc->mon_cmd_tree);
+}
+
+static struct ceph_msg *get_mon_cmd_reply(struct ceph_connection *con,
+					  struct ceph_msg_header *hdr,
+					  int *skip)
+{
+	struct ceph_mon_client *monc = con->private;
+	struct ceph_mon_cmd_req *req;
+	u64 tid = le64_to_cpu(hdr->tid);
+	struct ceph_msg *m;
+
+	mutex_lock(&monc->mutex);
+	req = __lookup_mon_cmd(monc, tid);
+	if (!req) {
+		dout("%s: can't find tid %lld\n", __func__, tid);
+		*skip = 1;
+		m = NULL;
+	} else {
+		dout("%s: %lld got %p\n", __func__, tid, req->reply);
+		*skip = 0;
+		m = ceph_msg_get(req->reply);
+	}
+	mutex_unlock(&monc->mutex);
+	return m;
+}
+
+#define CEPH_MSG_MON_COMMAND 50
+#define CEPH_MSG_MON_COMMAND_ACK 51
+
+static void free_mon_cmd(struct kref *kref)
+{
+	struct ceph_mon_cmd_req *req;
+
+	req = container_of(kref, struct ceph_mon_cmd_req, kref);
+
+	if (req->request)
+		ceph_msg_put(req->request);
+	if (req->reply)
+		ceph_msg_put(req->reply);
+}
+
+static int do_mon_cmd(struct ceph_mon_client *monc,
+		      struct ceph_mon_cmd_req *req)
+{
+	int ret;
+
+	mutex_lock(&monc->mutex);
+	req->tid = req->request->hdr.tid = cpu_to_le64(++monc->last_tid);
+	__insert_mon_cmd(monc, req);
+	ceph_con_send(&monc->con, ceph_msg_get(req->request));
+	mutex_unlock(&monc->mutex);
+
+	ret = wait_for_completion_interruptible(&req->completion);
+
+	mutex_lock(&monc->mutex);
+	rb_erase(&req->node, &monc->mon_cmd_tree);
+	if (!ret)
+		ret = req->result;
+	mutex_unlock(&monc->mutex);
+
+	return ret;
+}
+
+int ceph_monc_blacklist_add(struct ceph_mon_client *monc,
+			    struct ceph_entity_addr *target)
+{
+	struct ceph_mon_cmd_req *req;
+	char *cmd_str;
+	struct ceph_mon_cmd *cmd;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_NOFS);
+	if (!req)
+		return -ENOMEM;
+
+	kref_init(&req->kref);
+
+	cmd_str = kasprintf(GFP_NOFS, "{\"prefix\": \"osd blacklist\", \"blacklistop\": \"add\", \"addr\": \"%pISp/%u\"}", &target->in_addr, target->nonce);
+	if (!cmd_str) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	req->request = ceph_msg_new(CEPH_MSG_MON_COMMAND,
+				    sizeof(*cmd) + strlen(cmd_str),
+				    GFP_NOFS, true);
+	if (!req->request) {
+		ret = -ENOMEM;
+		goto free_str;
+	}
+
+/* XXX message len */
+	req->reply = ceph_msg_new(CEPH_MSG_MON_COMMAND_ACK, 1024,
+				  GFP_NOFS, true);
+
+	init_completion(&req->completion);
+
+	req->request->hdr.version = cpu_to_le16(2);
+	cmd = req->request->front.iov_base;
+	cmd->monhdr.have_version = 0;
+	cmd->monhdr.session_mon = cpu_to_le16(-1);
+	cmd->monhdr.session_mon_tid = 0;
+	cmd->fsid = monc->monmap->fsid;
+	cmd->num_cmds = 1;
+	cmd->str_len = strlen(cmd_str);
+	strcpy(cmd->cmd_str, cmd_str);
+
+	ret = do_mon_cmd(monc, req);
+
+free_str:
+	kfree(cmd_str);
+out:
+	kref_put(&req->kref, free_mon_cmd);
+	return ret;
+}
+EXPORT_SYMBOL(ceph_monc_blacklist_add);
+
+static void ceph_monc_handle_cmd_ack(struct ceph_mon_client *monc,
+				     struct ceph_msg *msg)
+{
+	struct ceph_mon_cmd_req *req;
+	void *p = msg->front.iov_base;
+	void *end = p + msg->front_alloc_len;
+	char *rs = NULL;
+	char *cmd = NULL;
+	u32 num_cmds;
+	s32 return_code;
+	u64 tid = le64_to_cpu(msg->hdr.tid);
+	int i;
+
+	mutex_lock(&monc->mutex);
+	req = __lookup_mon_cmd(monc, tid);
+	if (req)
+		kref_get(&req->kref);
+	mutex_unlock(&monc->mutex);
+	if (!req) {
+		pr_warn("%s: unmatched mon_cmd_ack", __func__);
+		return;
+	}
+
+	req->result = -ERANGE;
+
+	p += sizeof(struct ceph_mon_request_header);
+
+	ceph_decode_32_safe(&p, end, return_code, out);
+	rs = ceph_extract_encoded_string(&p, end, NULL, GFP_NOIO);
+	if (IS_ERR(rs)) {
+		req->result = PTR_ERR(rs);
+		return;
+	}
+	ceph_decode_32_safe(&p, end, num_cmds, free_string);
+
+	dout("%s: ack for mon_cmds ( ", __func__);
+
+	for (i = 0; i < num_cmds; i++) {
+		cmd = ceph_extract_encoded_string(&p, end, NULL, GFP_NOIO);
+		if (IS_ERR(cmd)) {
+			req->result = PTR_ERR(cmd);
+			goto free_string;
+		}
+		dout("%s ", cmd);
+		kfree(cmd);
+	}
+
+	dout(" ) returned %s result %u\n", rs, return_code);
+
+	req->result = return_code;
+
+free_string:
+	kfree(rs);
+out:
+	if (req) {
+		complete_all(&req->completion);
+		kref_put(&req->kref, free_mon_cmd);
+	}
+}
+
 /*
  * Do a synchronous pool op.
  */
@@ -1039,6 +1254,8 @@ int ceph_monc_init(struct ceph_mon_client *monc, struct ceph_client *cl)
 	INIT_DELAYED_WORK(&monc->delayed_work, delayed_work);
 	monc->generic_request_tree = RB_ROOT;
 	monc->num_generic_requests = 0;
+	monc->mon_cmd_tree = RB_ROOT;
+	monc->num_mon_cmds = 0;
 	monc->last_tid = 0;
 
 	return 0;
@@ -1207,6 +1424,10 @@ static void dispatch(struct ceph_connection *con, struct ceph_msg *msg)
 		ceph_osdc_handle_map(&monc->client->osdc, msg);
 		break;
 
+	case CEPH_MSG_MON_COMMAND_ACK:
+		ceph_monc_handle_cmd_ack(monc, msg);
+		break;
+
 	default:
 		/* can the chained handler handle it? */
 		if (monc->client->extra_mon_dispatch &&
@@ -1259,6 +1480,8 @@ static struct ceph_msg *mon_alloc_msg(struct ceph_connection *con,
 		if (!m)
 			return NULL;	/* ENOMEM--return skip == 0 */
 		break;
+	case CEPH_MSG_MON_COMMAND_ACK:
+		return get_mon_cmd_reply(con, hdr, skip);
 	}
 
 	if (!m) {
