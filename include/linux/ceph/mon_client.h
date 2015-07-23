@@ -56,6 +56,26 @@ struct ceph_mon_generic_request {
 	struct ceph_msg *reply;    /* and reply */
 };
 
+struct ceph_mon_cmd {
+	struct ceph_mon_request_header monhdr;
+	struct ceph_fsid fsid;
+	/* vector<string> */
+	u32 num_cmds;
+	u32 str_len;
+	char cmd_str[0];
+} __attribute__((packed));
+
+struct ceph_mon_cmd_req {
+	struct kref kref;
+	u64 tid;
+	struct rb_node node;
+	struct ceph_mon_cmd cmd;
+	int result;
+	struct completion completion;
+	struct ceph_msg *request;
+	struct ceph_msg *reply;
+};
+
 struct ceph_mon_client {
 	struct ceph_client *client;
 	struct ceph_monmap *monmap;
@@ -76,6 +96,9 @@ struct ceph_mon_client {
 	struct rb_root generic_request_tree;
 	int num_generic_requests;
 	u64 last_tid;
+
+	struct rb_root mon_cmd_tree;
+	int num_mon_cmds;
 
 	/* mds/osd map */
 	int want_mdsmap;
@@ -117,6 +140,8 @@ extern int ceph_monc_open_session(struct ceph_mon_client *monc);
 
 extern int ceph_monc_validate_auth(struct ceph_mon_client *monc);
 
+extern int ceph_monc_blacklist_add(struct ceph_mon_client *monc,
+				   struct ceph_entity_addr *target);
 extern int ceph_monc_create_snapid(struct ceph_mon_client *monc,
 				   u32 pool, u64 *snapid);
 
