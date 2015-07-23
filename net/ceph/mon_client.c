@@ -828,6 +828,124 @@ int ceph_monc_get_version_async(struct ceph_mon_client *monc, const char *what,
 }
 EXPORT_SYMBOL(ceph_monc_get_version_async);
 
+#define CEPH_MSG_MON_COMMAND 50
+#define CEPH_MSG_MON_COMMAND_ACK 51
+
+int ceph_monc_blacklist_add(struct ceph_mon_client *monc,
+			    struct ceph_entity_addr *target)
+{
+	struct ceph_mon_generic_request *req;
+	char *cmd_str = NULL;
+	struct ceph_mon_cmd *cmd;
+	size_t buf_len;
+	int ret;
+
+	req = alloc_generic_request(monc, GFP_NOFS);
+	if (!req)
+		return -ENOMEM;
+
+	cmd_str = kasprintf(GFP_NOFS, "{\"prefix\": \"osd blacklist\", \"blacklistop\": \"add\", \"addr\": \"%pISp/%u\"}", &target->in_addr, target->nonce);
+	if (!cmd_str) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	buf_len = sizeof(*cmd) + strlen(cmd_str);
+
+	req->request = ceph_msg_new(CEPH_MSG_MON_COMMAND, buf_len,
+				    GFP_NOFS, true);
+	if (!req->request) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* We just use a full page because we don't know the ack size in
+	   advance. */
+	req->reply = ceph_msg_new(CEPH_MSG_MON_COMMAND_ACK, PAGE_SIZE,
+				  GFP_NOFS, true);
+
+	mutex_lock(&monc->mutex);
+	register_generic_request(req);
+	cmd = req->request->front.iov_base;
+	cmd->monhdr.have_version = 0;
+	cmd->monhdr.session_mon = cpu_to_le16(-1);
+	cmd->monhdr.session_mon_tid = 0;
+	cmd->fsid = monc->monmap->fsid;
+	cmd->num_cmds = 1;
+	cmd->str_len = strlen(cmd_str);
+	strcpy(cmd->cmd_str, cmd_str);
+
+	req->request->hdr.version = cpu_to_le16(2);
+
+	send_generic_request(monc, req);
+	mutex_unlock(&monc->mutex);
+
+	ret = wait_generic_request(req);
+
+out:
+	kfree(cmd_str);
+	put_generic_request(req);
+	return ret;
+}
+EXPORT_SYMBOL(ceph_monc_blacklist_add);
+
+static void ceph_monc_handle_cmd_ack(struct ceph_mon_client *monc,
+				     struct ceph_msg *msg)
+{
+	struct ceph_mon_generic_request *req;
+	void *p = msg->front.iov_base;
+	void *end = p + msg->front_alloc_len;
+	char *rs = NULL;
+	char *cmd = NULL;
+	u32 num_cmds;
+	s32 return_code;
+	u64 tid = le64_to_cpu(msg->hdr.tid);
+	int i;
+
+	mutex_lock(&monc->mutex);
+	req = lookup_generic_request(&monc->generic_request_tree, tid);
+	if (!req) {
+		pr_warn("%s: unmatched mon_cmd_ack", __func__);
+		mutex_unlock(&monc->mutex);
+		return;
+	}
+
+	req->result = -ERANGE;
+
+	p += sizeof(struct ceph_mon_request_header);
+
+	ceph_decode_32_safe(&p, end, return_code, out);
+	rs = ceph_extract_encoded_string(&p, end, NULL, GFP_NOIO);
+	if (IS_ERR(rs)) {
+		req->result = PTR_ERR(rs);
+		return;
+	}
+	ceph_decode_32_safe(&p, end, num_cmds, out);
+
+	dout("%s: ack for mon_cmds ( ", __func__);
+
+	for (i = 0; i < num_cmds; i++) {
+		cmd = ceph_extract_encoded_string(&p, end, NULL, GFP_NOIO);
+		if (IS_ERR(cmd)) {
+			req->result = PTR_ERR(cmd);
+			goto out;
+		}
+		dout("%s ", cmd);
+		kfree(cmd);
+	}
+
+	dout(" ) returned %s result %u\n", rs, return_code);
+
+	req->result = return_code;
+	__finish_generic_request(req);
+	mutex_unlock(&monc->mutex);
+
+	complete_generic_request(req);
+
+out:
+	kfree(rs);
+}
+
 /*
  * Resend pending generic requests.
  */
@@ -1138,6 +1256,10 @@ static void dispatch(struct ceph_connection *con, struct ceph_msg *msg)
 		ceph_osdc_handle_map(&monc->client->osdc, msg);
 		break;
 
+	case CEPH_MSG_MON_COMMAND_ACK:
+		ceph_monc_handle_cmd_ack(monc, msg);
+		break;
+
 	default:
 		/* can the chained handler handle it? */
 		if (monc->client->extra_mon_dispatch &&
@@ -1169,6 +1291,7 @@ static struct ceph_msg *mon_alloc_msg(struct ceph_connection *con,
 		m = ceph_msg_get(monc->m_subscribe_ack);
 		break;
 	case CEPH_MSG_STATFS_REPLY:
+	case CEPH_MSG_MON_COMMAND_ACK:
 		return get_generic_reply(con, hdr, skip);
 	case CEPH_MSG_AUTH_REPLY:
 		m = ceph_msg_get(monc->m_auth_reply);
