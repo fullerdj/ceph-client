@@ -2782,10 +2782,10 @@ int ceph_osdc_create_watch_event(struct ceph_osd_client *osdc,
 	event->watch.watchcb = watchcb;
 	event->watch.errcb = errcb;
 
-	spin_lock(&osdc->event_lock);
+	mutex_lock(&osdc->event_mutex);
 	event->cookie = ++osdc->event_count;
 	__insert_event(osdc, event);
-	spin_unlock(&osdc->event_lock);
+	mutex_unlock(&osdc->event_mutex);
 	*pevent = event;
 	return 0;
 }
@@ -2803,10 +2803,10 @@ int ceph_osdc_create_notify_event(struct ceph_osd_client *osdc,
 	event->notify.notify_id = 0;
 	init_completion(&event->notify.complete);
 
-	spin_lock(&osdc->event_lock);
+	mutex_lock(&osdc->event_mutex);
 	event->cookie = ++osdc->event_count;
 	__insert_event(osdc, event);
-	spin_unlock(&osdc->event_lock);
+	mutex_unlock(&osdc->event_mutex);
 
 	*pevent = event;
 	return 0;
@@ -2825,9 +2825,9 @@ void ceph_osdc_cancel_event(struct ceph_osd_event *event)
 	struct ceph_osd_client *osdc = event->osdc;
 
 	dout("cancel_event %p\n", event);
-	spin_lock(&osdc->event_lock);
+	mutex_lock(&osdc->event_mutex);
 	__remove_event(event);
-	spin_unlock(&osdc->event_lock);
+	mutex_unlock(&osdc->event_mutex);
 	ceph_osdc_put_event(event); /* caller's */
 }
 EXPORT_SYMBOL(ceph_osdc_cancel_event);
@@ -2866,11 +2866,11 @@ static void __do_event(struct ceph_osd_client *osdc, u8 opcode,
 	struct ceph_osd_event *event;
 	struct ceph_osd_event_work *event_work;
 
-	spin_lock(&osdc->event_lock);
+	mutex_lock(&osdc->event_mutex);
 	event = __find_event(osdc, cookie);
 	if (event)
 		get_event(event);
-	spin_unlock(&osdc->event_lock);
+	mutex_unlock(&osdc->event_mutex);
 
 	dout("do_event cookie %lld event %p notify id %llu payload "
 	     "len %u return code %d notifier gid %llu\n",
@@ -3212,7 +3212,7 @@ int ceph_osdc_init(struct ceph_osd_client *osdc, struct ceph_client *client)
 	INIT_DELAYED_WORK(&osdc->timeout_work, handle_timeout);
 	INIT_DELAYED_WORK(&osdc->osds_timeout_work, handle_osds_timeout);
 	INIT_DELAYED_WORK(&osdc->linger_ping_work, handle_linger_ping);
-	spin_lock_init(&osdc->event_lock);
+	mutex_init(&osdc->event_mutex);
 	osdc->event_tree = RB_ROOT;
 	osdc->event_count = 0;
 
