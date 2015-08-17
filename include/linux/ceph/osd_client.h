@@ -263,7 +263,7 @@ struct ceph_osd_client {
 	struct ceph_msgpool	msgpool_op;
 	struct ceph_msgpool	msgpool_op_reply;
 
-	spinlock_t		event_lock;
+	struct mutex		event_mutex;
 	struct rb_root		event_tree;
 	u64			event_count;
 
