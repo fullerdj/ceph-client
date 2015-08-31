@@ -27,6 +27,7 @@
 #define RBD_HEADER_PREFIX      "rbd_header."
 #define RBD_DATA_PREFIX        "rbd_data."
 #define RBD_ID_PREFIX          "rbd_id."
+#define RBD_CHILDREN           "rbd_children"
 
 /*
  * For format version 1, rbd image 'foo' consists of objects
