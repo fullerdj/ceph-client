@@ -116,6 +116,7 @@ struct ceph_osd_req_op {
 		struct {
 			u64 cookie;
 			struct ceph_osd_data request_data;
+			struct ceph_osd_data response_data;
 		} notify;
 		struct {
 			u64 expected_object_size;
@@ -201,6 +202,7 @@ struct ceph_osd_event {
 		} watch;
 		struct {
 			struct page **notify_data;
+			u64 notify_id;
 			size_t notify_data_len;
 			s32 return_code;
 			struct completion complete;
