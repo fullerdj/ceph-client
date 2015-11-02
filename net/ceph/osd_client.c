@@ -363,6 +363,7 @@ static void osd_req_op_data_release(struct ceph_osd_request *osd_req,
 		break;
 	case CEPH_OSD_OP_NOTIFY:
 		ceph_osd_data_release(&op->notify.request_data);
+		ceph_osd_data_release(&op->notify.response_data);
 		break;
 	case CEPH_OSD_OP_SETXATTR:
 	case CEPH_OSD_OP_CMPXATTR:
@@ -696,6 +697,45 @@ int osd_req_op_xattr_init(struct ceph_osd_request *osd_req, unsigned int which,
 }
 EXPORT_SYMBOL(osd_req_op_xattr_init);
 
+static void __notify_callback(struct ceph_osd_request *osd_req,
+			      struct ceph_msg *msg)
+{
+	struct ceph_osd_data *osd_data;
+	struct ceph_osd_event *notify_event;
+	int which;
+	u64 notify_id;
+	void *p, *end;
+
+	for (which = 0; which < osd_req->r_num_ops; which++)
+		if (osd_req->r_ops[which].op == CEPH_OSD_OP_NOTIFY)
+			break;
+
+	BUG_ON(which == osd_req->r_num_ops);
+	osd_data = osd_req_op_data(osd_req, which, notify,
+				   response_data);
+
+	BUG_ON(osd_data->type != CEPH_OSD_DATA_TYPE_PAGES);
+
+	if (!osd_req->r_ops[which].outdata_len) {
+		dout("no notify_id received\n");
+		goto out;
+	}
+
+	p = page_address(osd_data->pages[0]);
+	end = p + osd_req->r_ops[which].outdata_len;
+	ceph_decode_need(&p, end, sizeof(u64), out);
+	notify_id = ceph_decode_64(&p);
+	notify_event = __find_event(osd_req->r_osdc,
+				    osd_req->r_ops[which].notify.cookie);
+	if (!notify_event)
+		goto out;
+
+	notify_event->notify.notify_id = notify_id;
+out:
+	ceph_release_page_vector(osd_data->pages, 1);
+	complete_all(&osd_req->r_completion);
+}
+
 void osd_req_op_notify_init(struct ceph_osd_request *osd_req,
 			    unsigned int which,
 			    u16 opcode, u64 cookie)
@@ -703,16 +743,29 @@ void osd_req_op_notify_init(struct ceph_osd_request *osd_req,
 	struct ceph_osd_req_op *op = _osd_req_op_init(osd_req, which,
 						      opcode, 0);
 	struct ceph_osd_event *notify_event;
+	struct ceph_osd_data *osd_data;
+	struct page **response_pages;
 
 	BUG_ON(opcode != CEPH_OSD_OP_NOTIFY);
 
+	op->notify.cookie = cookie;
 	notify_event = __find_event(osd_req->r_osdc, cookie);
 	/* Only linger if the caller is interested in the notify acks. */
 	if (notify_event) {
+		osd_req->r_callback = __notify_callback;
 		ceph_osdc_set_request_linger(osd_req->r_osdc, osd_req);
 		notify_event->osd_req = osd_req;
+
+		response_pages = ceph_alloc_page_vector(1, GFP_NOFS);
+		if (IS_ERR(response_pages)) {
+			pr_warn("failed to allocate memory for notify_id");
+			return;
+		}
+		osd_data = osd_req_op_data(osd_req, which, notify,
+					   response_data);
+		ceph_osd_data_pages_init(osd_data, response_pages, sizeof(u64),
+					 0, false, false);
 	}
-	op->notify.cookie = cookie;
 }
 EXPORT_SYMBOL(osd_req_op_notify_init);
 
@@ -849,6 +902,8 @@ static u64 osd_req_encode_op(struct ceph_osd_request *req,
 			src->indata_len += data_length;
 			request_data_len += data_length;
 		}
+		osd_data = &src->notify.response_data;
+		ceph_osdc_msg_data_add(req->r_reply, osd_data);
 		break;
 	case CEPH_OSD_OP_NOTIFY_ACK:
 		osd_data = &src->watch.request_data;
@@ -2709,6 +2764,7 @@ int ceph_osdc_create_notify_event(struct ceph_osd_client *osdc,
 	if (!event)
 		return -ENOMEM;
 
+	event->notify.notify_id = 0;
 	init_completion(&event->notify.complete);
 
 	spin_lock(&osdc->event_lock);
@@ -2851,6 +2907,8 @@ static void handle_watch_notify(struct ceph_osd_client *osdc,
 	ceph_decode_64_safe(&p, end, cookie, bad);
 	ceph_decode_64_safe(&p, end, ver, bad);
 	ceph_decode_64_safe(&p, end, notify_id, bad);
+
+	dout("looking for notify_id %llu\n", notify_id);
 
 	if (proto_ver >= 1) {
 		ceph_decode_32_safe(&p, end, payload_len, bad);
