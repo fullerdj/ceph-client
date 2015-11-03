@@ -3222,8 +3222,11 @@ static int __send_async_notify(struct rbd_device *rbd_dev, struct page **reply,
 	     osd_req->r_tid);
 
 	ret = ceph_osdc_wait_request(osdc, osd_req);
-	if (ret)
+
+	if (ret < 0) {
+		rbd_warn(rbd_dev, "notify failed: %d", ret);
 		goto cancel_event;
+	}
 
 	ceph_osdc_wait_event(osdc, notify_event);
 
