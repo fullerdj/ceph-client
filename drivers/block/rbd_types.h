@@ -25,6 +25,7 @@
  */
 
 #define RBD_HEADER_PREFIX      "rbd_header."
+#define RBD_OBJECT_MAP_PREFIX  "rbd_object_map."
 #define RBD_DATA_PREFIX        "rbd_data."
 #define RBD_ID_PREFIX          "rbd_id."
 #define RBD_CHILDREN           "rbd_children"
