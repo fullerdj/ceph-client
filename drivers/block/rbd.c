@@ -580,6 +580,8 @@ static int _rbd_dev_v2_snap_features(struct rbd_device *rbd_dev, u64 snap_id,
 
 static void rbd_progress_async_op(struct rbd_async_op *op);
 static void rbd_notify_async_progress(struct work_struct *work);
+static int rbd_handle_flatten(struct rbd_device *rbd_dev,
+			      void *start, void *end);
 
 static int rbd_open(struct block_device *bdev, fmode_t mode)
 {
@@ -3684,6 +3686,12 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 	case RBD_NOTIFY_OP_ASYNC_COMPLETE:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
 		break;
+	case RBD_NOTIFY_OP_FLATTEN:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		ret = rbd_handle_flatten(rbd_dev, p, end);
+		if (ret)
+			rbd_warn(rbd_dev, "flatten failed: %d", ret);
+		break;
 	case RBD_NOTIFY_OP_RESIZE:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
 		ret = rbd_handle_resize(rbd_dev, p, end);
@@ -4301,6 +4309,187 @@ static void rbd_notify_async_progress(struct work_struct *work)
 
 	rbd_proxy_notify(rbd_dev, reply, message_len);
 	kfree(reply);
+}
+
+static void rbd_img_async_progress(struct rbd_img_request *img_request)
+{
+	struct rbd_async_op *op = img_request->async_op;
+
+	if (img_request->result) {
+		mutex_lock(&op->mutex);
+		op->result = img_request->result;
+		mutex_unlock(&op->mutex);
+	}
+	rbd_img_request_put(img_request);
+	rbd_progress_async_op(op);
+}
+
+static void rbd_flatten_copy_object(struct work_struct *work)
+{
+	struct rbd_async_work *flatten_work;
+	struct rbd_async_op *op;
+	struct rbd_device *rbd_dev;
+	struct rbd_img_request *img_request;
+	struct ceph_snap_context *snapc;
+	int ret;
+	u64 byte;
+	u64 step;
+
+	flatten_work = container_of(work, struct rbd_async_work, work);
+	op = flatten_work->op;
+	kfree(flatten_work);
+
+	rbd_dev = op->rbd_dev;
+
+	down_read(&rbd_dev->header_rwsem);
+	step = rbd_obj_bytes(&rbd_dev->header);
+	snapc = rbd_dev->header.snapc;
+	up_read(&rbd_dev->header_rwsem);
+
+	mutex_lock(&op->mutex);
+	byte = op->cur_byte;
+	op->cur_byte += step;
+	mutex_unlock(&op->mutex);
+
+	dout("%s byte %llu", __func__, byte);
+
+	img_request = rbd_img_request_create(rbd_dev, byte, 0, OBJ_OP_WRITE,
+					     snapc);
+	if (!img_request) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	ret = rbd_img_request_fill(img_request, OBJ_REQUEST_NODATA, NULL);
+	if (ret)
+		goto err;
+
+	ceph_get_snap_context(snapc); /* put when img_request is destroyed */
+	img_request->async_op = op;
+	img_request->callback = rbd_img_async_progress;
+
+	ret = rbd_img_request_submit(img_request);
+	if (ret)
+		goto err;
+
+	return;
+err:
+	mutex_lock(&op->mutex);
+	op->result = ret;
+	mutex_unlock(&op->mutex);
+}
+
+static int rbd_remove_child(struct rbd_device *rbd_dev,
+			    struct rbd_spec *parent_spec)
+{
+	u64 pool_id = parent_spec->pool_id;
+	const char *image_id = parent_spec->image_id;
+	u64 snap_id = parent_spec->snap_id;
+	const char *c_image_id = rbd_dev->spec->image_id;
+
+	struct page *req_data;
+	void *p, *end;
+	size_t msg_len;
+	int ret;
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data)
+		return -ENOMEM;
+
+	ret = -ERANGE;
+	p = page_address(req_data);
+	end = p + PAGE_SIZE;
+	msg_len = sizeof(pool_id) + sizeof(u32) + strlen(image_id) +
+		  sizeof(snap_id) + sizeof(u32) + strlen(c_image_id);
+	ceph_encode_need(&p, end, msg_len, out);
+	ceph_encode_64(&p, pool_id);
+	ceph_encode_string(&p, end, image_id, strlen(image_id));
+	ceph_encode_64(&p, snap_id);
+	ceph_encode_string(&p, end, c_image_id, strlen(c_image_id));
+
+	dout("%s: remove from %s\n", __func__,
+	     rbd_dev->parent->header_oid.name);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id, RBD_CHILDREN,
+				 "rbd", "remove_child",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 &req_data, msg_len, NULL, 0);
+
+out:
+	__free_page(req_data);
+	return ret;
+}
+
+static int rbd_handle_flatten(struct rbd_device *rbd_dev,
+			      void *start, void *end)
+{
+	u64 gid, handle, request_id;
+	u64 bound;
+	struct rbd_async_op *op;
+	struct rbd_spec *parent_spec = NULL;
+	void *p;
+	int ret;
+
+	dout("%s: overlap %llu", __func__, rbd_dev->parent_overlap);
+
+	p = start;
+	ceph_decode_64_safe(&p, end, gid, err);
+	ceph_decode_64_safe(&p, end, handle, err);
+	ceph_decode_64_safe(&p, end, request_id, err);
+
+	rbd_assert(rbd_dev->parent_overlap > 0);
+	bound = rbd_dev->parent_overlap - 1;
+
+	op = rbd_start_async_op(rbd_dev, 0, bound, gid, handle, request_id,
+				rbd_flatten_copy_object);
+	if (IS_ERR(op)) {
+		if (PTR_ERR(op) == -EPERM || PTR_ERR(op) == -EEXIST)
+			return 0;
+		return PTR_ERR(op);
+	}
+
+	ret = wait_for_completion_interruptible(&op->done);
+	if (ret)
+		goto out;
+
+	down_write(&rbd_dev->lock_rwsem);
+	list_del(&op->ops_entry);
+	up_write(&rbd_dev->lock_rwsem);
+
+	if (op->result) {
+		ret = op->result;
+		goto out;
+	}
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->header_oid.name,
+				 "rbd", "remove_parent",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 NULL, 0, NULL, 0);
+
+	if (ret != -ENOENT && ret != 0) /* ok if someone unparented first */
+		ret = op->result;
+
+	down_read(&rbd_dev->header_rwsem);
+	parent_spec = rbd_dev->parent_spec;
+	if (parent_spec)
+		rbd_spec_get(parent_spec);
+	up_read(&rbd_dev->header_rwsem);
+
+	if (parent_spec)
+		rbd_remove_child(rbd_dev, parent_spec);
+
+	rbd_dev_refresh(rbd_dev);
+
+out:
+	kref_put(&op->kref, __release_async_op);
+	rbd_notify_async_complete(rbd_dev, gid, handle, request_id, ret);
+	rbd_warn(rbd_dev, "flatten complete");
+	return ret;
+err:
+	return -ERANGE;
 }
 
 /*

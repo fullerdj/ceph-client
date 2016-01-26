@@ -27,6 +27,7 @@
 #define RBD_HEADER_PREFIX      "rbd_header."
 #define RBD_DATA_PREFIX        "rbd_data."
 #define RBD_ID_PREFIX          "rbd_id."
+#define RBD_CHILDREN           "rbd_children"
 
 /*
  * For format version 1, rbd image 'foo' consists of objects
@@ -84,6 +85,7 @@ enum rbd_notify_op {
 	RBD_NOTIFY_OP_HEADER_UPDATE      = 3,
 	RBD_NOTIFY_OP_ASYNC_PROGRESS     = 4,
 	RBD_NOTIFY_OP_ASYNC_COMPLETE     = 5,
+	RBD_NOTIFY_OP_FLATTEN            = 6,
 	RBD_NOTIFY_OP_RESIZE             = 7,
 	RBD_NOTIFY_OP_SNAP_CREATE        = 8,
 	RBD_NOTIFY_OP_SNAP_REMOVE        = 9,
