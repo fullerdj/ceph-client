@@ -2316,7 +2316,7 @@ static bool rbd_img_obj_end_request(struct rbd_obj_request *obj_request)
 	struct rbd_img_request *img_request;
 	unsigned int xferred;
 	int result;
-	bool more;
+	bool more = false;
 
 	rbd_assert(obj_request_img_data_test(obj_request));
 	img_request = obj_request->img_request;
@@ -2359,7 +2359,7 @@ static bool rbd_img_obj_end_request(struct rbd_obj_request *obj_request)
 	if (img_request_child_test(img_request)) {
 		rbd_assert(img_request->obj_request != NULL);
 		more = obj_request->which < img_request->obj_request_count - 1;
-	} else {
+	} else if (img_request->rq) {
 		rbd_assert(img_request->rq != NULL);
 
 		more = blk_update_request(img_request->rq, result, xferred);
@@ -2504,7 +2504,6 @@ static int rbd_img_request_fill(struct rbd_img_request *img_request,
 
 	img_offset = img_request->offset;
 	resid = img_request->length;
-	rbd_assert(resid > 0);
 	op_type = rbd_img_request_op_type(img_request);
 
 	if (type == OBJ_REQUEST_BIO) {
@@ -2515,7 +2514,7 @@ static int rbd_img_request_fill(struct rbd_img_request *img_request,
 		pages = data_desc;
 	}
 
-	while (resid) {
+	do {
 		struct ceph_osd_request *osd_req;
 		const char *object_name;
 		u64 offset;
@@ -2578,7 +2577,7 @@ static int rbd_img_request_fill(struct rbd_img_request *img_request,
 
 		img_offset += length;
 		resid -= length;
-	}
+	} while (resid);
 
 	return 0;
 
