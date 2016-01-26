@@ -130,6 +130,9 @@ static int atomic_dec_return_safe(atomic_t *v)
 	    (RBD_FEATURE_LAYERING | RBD_FEATURE_STRIPINGV2 | \
 	     RBD_FEATURE_EXCLUSIVE_LOCK)
 
+#define RBD_FLAG_OBJECT_MAP_INVALID (1<<0)
+#define RBD_FLAG_FAST_DIFF_INVALID (1<<1)
+
 /* Features supported by this (client software) implementation. */
 
 #define RBD_FEATURES_SUPPORTED	(RBD_FEATURES_ALL)
@@ -197,6 +200,7 @@ struct rbd_spec {
 
 	u64		snap_id;
 	const char	*snap_name;
+	u64		ctx_flags;
 
 	struct kref	kref;
 };
@@ -3139,6 +3143,77 @@ out_err:
 
 static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev);
 static void __rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev);
+
+static int rbd_get_flags(struct rbd_device *rbd_dev, uint64_t *pflags)
+{
+	struct page *req_data;
+	struct page *resp_data;
+	size_t resp_len;
+	void *p;
+	int ret;
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data)
+		return -ENOMEM;
+
+	resp_data = alloc_page(GFP_NOIO);
+	if (!resp_data) {
+		__free_page(req_data);
+		return -ENOMEM;
+	}
+
+	p = page_address(req_data);
+	ceph_encode_64(&p, rbd_dev->spec->snap_id);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->header_oid.name,
+				 "rbd", "get_flags", CEPH_OSD_FLAG_READ,
+				 &req_data, sizeof(rbd_dev->spec->snap_id),
+				 &resp_data, &resp_len);
+
+	if (ret)
+		goto out;
+
+	p = page_address(resp_data);
+	*pflags = ceph_decode_64(&p);
+
+out:
+	__free_page(req_data);
+	__free_page(resp_data);
+	return ret;
+}
+
+static int rbd_set_flags(struct rbd_device *rbd_dev, uint64_t flags,
+			 uint64_t mask)
+{
+	struct page *req_data;
+	size_t req_len;
+	void *p;
+	int ret;
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data)
+		return -ENOMEM;
+
+	req_len = sizeof(flags) + sizeof(mask) +
+		sizeof(rbd_dev->spec->snap_id);
+
+	p = page_address(req_data);
+	ceph_encode_64(&p, flags);
+	ceph_encode_64(&p, mask);
+	ceph_encode_64(&p, rbd_dev->spec->snap_id);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->header_oid.name, "rbd", "set_flags",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 &req_data, req_len,
+				 NULL, NULL);
+
+	__free_page(req_data);
+	return ret;
+}
 
 static int rbd_async_notify_ack(struct rbd_device *rbd_dev, u64 notify_id,
 				int reply)
@@ -6633,6 +6708,7 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 	}
 
 	INIT_LIST_HEAD(&rbd_dev->async_ops);
+	rbd_dev->spec->ctx_flags = 0;
 
 	rc = rbd_dev_device_setup(rbd_dev);
 	if (rc) {
