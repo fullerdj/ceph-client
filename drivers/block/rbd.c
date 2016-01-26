@@ -112,6 +112,8 @@ static int atomic_dec_return_safe(atomic_t *v)
 #define RBD_LOCK_NAME	"rbd_lock"
 #define RBD_LOCK_TAG	"internal"
 #define RBD_LOCK_COOKIE_PREFIX	"auto"
+#define RBD_MAX_ASYNC_OUTSTANDING 4
+
 
 /* This allows a single page to hold an image name sent by OSD */
 #define RBD_IMAGE_NAME_LEN_MAX	(PAGE_SIZE - sizeof (__le32) - 1)
@@ -318,6 +320,7 @@ struct rbd_img_request {
 
 	u32			obj_request_count;
 	struct list_head	obj_requests;	/* rbd_obj_request structs */
+	struct rbd_async_op	*async_op;
 
 	struct kref		kref;
 };
@@ -381,9 +384,28 @@ struct rbd_device {
 
 	struct list_head	node;
 
+	struct list_head	async_ops;
+
 	/* sysfs related */
 	struct device		dev;
 	unsigned long		open_count;	/* protected by lock */
+};
+
+struct rbd_async_op {
+	struct kref kref;
+	struct work_struct progress_work;
+	struct rbd_device *rbd_dev;
+	struct list_head ops_entry;
+	struct mutex mutex;
+	struct completion done;
+	void (*workfn)(struct work_struct *);
+	u64 gid;
+	u64 handle;
+	u64 request_id;
+	int result;
+	u64 cur_byte;
+	u32 outstanding;
+	int remaining;
 };
 
 /*
@@ -416,6 +438,7 @@ static int rbd_major;
 static DEFINE_IDA(rbd_dev_id_ida);
 
 static struct workqueue_struct *rbd_wq;
+static struct workqueue_struct *rbd_async_wq;
 
 /*
  * Default to false for now, as single-major requires >= 0.75 version of
@@ -554,6 +577,9 @@ static int _rbd_dev_v2_snap_size(struct rbd_device *rbd_dev, u64 snap_id,
 static int rbd_dev_v2_features(struct rbd_device *rbd_dev);
 static int _rbd_dev_v2_snap_features(struct rbd_device *rbd_dev, u64 snap_id,
 		u64 *snap_features);
+
+static void rbd_progress_async_op(struct rbd_async_op *op);
+static void rbd_notify_async_progress(struct work_struct *work);
 
 static int rbd_open(struct block_device *bdev, fmode_t mode)
 {
@@ -2170,6 +2196,11 @@ static bool rbd_dev_parent_get(struct rbd_device *rbd_dev)
 	return counter > 0;
 }
 
+struct rbd_async_work {
+	struct work_struct work;
+	struct rbd_async_op *op;
+};
+
 /*
  * Caller is responsible for filling in the list of object requests
  * that comprises the image request, and the Linux request pointer
@@ -3250,6 +3281,103 @@ static int rbd_notify_async_complete(struct rbd_device *rbd_dev, u64 gid,
 	return ret;
 }
 
+static void __release_async_op(struct kref *kref)
+{
+	struct rbd_async_op *op = container_of(kref, struct rbd_async_op,
+					       kref);
+
+	dout("__release_async_op %p\n", op);
+	kfree(op);
+}
+
+static struct rbd_async_op *__alloc_async_op(struct rbd_device *rbd_dev,
+					     u64 gid, u64 handle,
+					     u64 request_id)
+{
+	struct rbd_async_op *op;
+
+	op = kzalloc(sizeof(*op), GFP_NOIO);
+	if (!op)
+		return NULL;
+
+	dout("%s: %p\n", __func__, op);
+	kref_init(&op->kref);
+	op->rbd_dev = rbd_dev;
+	op->gid = gid;
+	op->handle = handle;
+	op->request_id = request_id;
+	INIT_LIST_HEAD(&op->ops_entry);
+	mutex_init(&op->mutex);
+	init_completion(&op->done);
+
+	return op;
+}
+
+static struct rbd_async_op *__find_async_op(struct rbd_device *rbd_dev,
+					    u64 gid, u64 handle, u64 request_id)
+{
+	struct rbd_async_op *op;
+	bool found = false;
+
+	list_for_each_entry(op, &rbd_dev->async_ops, ops_entry) {
+		if (request_id == op->request_id &&
+		    handle == op->handle &&
+		    gid == op->gid) {
+			found = true;
+			break;
+		}
+	}
+
+	return found ? op : NULL;
+}
+
+static int rbd_flush_async_ops(struct rbd_device *rbd_dev,
+			       unsigned long timeout)
+{
+	int ret = 0;
+	struct rbd_async_op *op;
+
+check:
+	down_read(&rbd_dev->lock_rwsem);
+	op = list_first_entry_or_null(&rbd_dev->async_ops,
+				      struct rbd_async_op, ops_entry);
+	if (!op) {
+		up_read(&rbd_dev->lock_rwsem);
+		return 0;
+	}
+
+	dout("%s: waiting for op %llu (%llu)\n",
+	     __func__, op->request_id, op->cur_byte);
+	kref_get(&op->kref);
+	up_read(&rbd_dev->lock_rwsem);
+
+	if (op->rbd_dev == rbd_dev)
+		ret = wait_for_completion_interruptible_timeout(&op->done,
+						 ceph_timeout_jiffies(timeout));
+	kref_put(&op->kref, __release_async_op);
+
+	if (ret == 0)
+		return -ETIMEDOUT;
+	if (ret < 0)
+		return ret;
+
+	goto check;
+}
+
+static void rbd_cancel_async_ops(struct rbd_device *rbd_dev)
+{
+	struct rbd_async_op *op;
+
+	down_read(&rbd_dev->lock_rwsem);
+	list_for_each_entry(op, &rbd_dev->async_ops, ops_entry) {
+		mutex_lock(&op->mutex);
+		if (op->rbd_dev == rbd_dev)
+			op->result = -ECANCELED;
+		mutex_unlock(&op->mutex);
+	}
+	up_read(&rbd_dev->lock_rwsem);
+}
+
 static int rbd_handle_acquired_lock(struct rbd_device *rbd_dev, void *start,
 				    void *end)
 {
@@ -3553,6 +3681,7 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 			rbd_warn(rbd_dev, "refresh failed: %d", ret);
 		rbd_async_notify_ack(rbd_dev, notify_id, ret);
 		break;
+	case RBD_NOTIFY_OP_ASYNC_PROGRESS:
 	case RBD_NOTIFY_OP_ASYNC_COMPLETE:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
 		break;
@@ -4025,6 +4154,154 @@ out:
 	kfree(ondisk);
 
 	return ret;
+}
+
+static void rbd_async_send_next(struct rbd_async_op *op)
+{
+	struct rbd_async_work *async_work;
+
+	async_work = kmalloc(sizeof(struct rbd_async_work), GFP_NOIO);
+	if (!async_work) {
+		mutex_lock(&op->mutex);
+		op->result = -ENOMEM;
+		mutex_unlock(&op->mutex);
+		rbd_progress_async_op(op);
+		return;
+	}
+
+	async_work->op = op;
+	INIT_WORK(&async_work->work, op->workfn);
+	queue_work(rbd_async_wq, &async_work->work);
+}
+
+static void rbd_complete_async_op(struct rbd_async_op *op)
+{
+	int outstanding;
+
+	mutex_lock(&op->mutex);
+	outstanding = --op->outstanding;
+	mutex_unlock(&op->mutex);
+
+	dout("%s: one complete, %d outstanding\n", __func__, outstanding);
+
+	if (!outstanding) {
+		dout("%s: all complete\n", __func__);
+		complete_all(&op->done);
+	}
+}
+
+static void rbd_progress_async_op(struct rbd_async_op *op)
+{
+	int remaining;
+	int result = 0;
+
+	mutex_lock(&op->mutex);
+	remaining = --op->remaining;
+	if (op->result)
+		result = op->result;
+	mutex_unlock(&op->mutex);
+
+	kref_get(&op->kref);
+	queue_work(rbd_async_wq, &op->progress_work);
+
+	if (result || remaining < 0)
+		rbd_complete_async_op(op);
+	else
+		rbd_async_send_next(op);
+}
+
+static struct rbd_async_op *rbd_start_async_op(
+					   struct rbd_device *rbd_dev,
+					   u64 start, u64 bound,
+					   u64 gid, u64 handle, u64 request_id,
+					   void (*workfn)(struct work_struct *))
+{
+	enum rbd_lock_state state;
+	struct rbd_async_op *op;
+	int i;
+	int outstanding;
+
+	down_read(&rbd_dev->lock_rwsem);
+	state = rbd_dev->lock_state;
+	op = __find_async_op(rbd_dev, gid, handle, request_id);
+	up_read(&rbd_dev->lock_rwsem);
+
+	if (state != RBD_LOCK_STATE_LOCKED)
+		return ERR_PTR(-EPERM);
+
+	if (op)
+		return ERR_PTR(-EEXIST);
+
+	op = __alloc_async_op(rbd_dev, gid, handle, request_id);
+	if (!op)
+		return ERR_PTR(-ENOMEM);
+
+	op->remaining = (bound >> rbd_dev->header.obj_order) -
+		(start >> rbd_dev->header.obj_order) + 1;
+
+	rbd_assert(op->remaining > 0);
+
+	kref_get(&op->kref);
+	op->cur_byte = start;
+	outstanding = min(RBD_MAX_ASYNC_OUTSTANDING, op->remaining);
+	op->outstanding = outstanding;
+	dout("%d remaining\n", op->remaining);
+	op->workfn = workfn;
+
+	down_write(&rbd_dev->lock_rwsem);
+	list_add_tail(&op->ops_entry, &rbd_dev->async_ops);
+	up_write(&rbd_dev->lock_rwsem);
+	INIT_WORK(&op->progress_work, rbd_notify_async_progress);
+
+	for (i = 0; i < outstanding; i++)
+		rbd_progress_async_op(op);
+
+	queue_work(rbd_async_wq, &op->progress_work);
+
+	return op;
+}
+
+static void rbd_notify_async_progress(struct work_struct *work)
+{
+	void *reply;
+	u64 gid;
+	u64 handle;
+	u64 request_id;
+	u64 offset;
+	u64 total;
+	u32 message_len;
+	struct rbd_device *rbd_dev;
+	void *p;
+
+	struct rbd_async_op *op = container_of(work, struct rbd_async_op,
+					       progress_work);
+
+	gid = op->gid;
+	handle = op->handle;
+	request_id = op->request_id;
+	offset = op->cur_byte; /* read race */
+	rbd_dev = op->rbd_dev;
+	total = rbd_dev->header.image_size; /* read race */
+	kref_put(&op->kref, __release_async_op);
+
+	message_len = sizeof(u32) + sizeof(gid) + sizeof(handle) +
+		      sizeof(request_id) + sizeof(offset) + sizeof(total);
+
+	reply = kmalloc(message_len, GFP_NOIO);
+	if (!reply)
+		return;
+
+	p = reply;
+
+	ceph_encode_32(&p, RBD_NOTIFY_OP_ASYNC_PROGRESS);
+	ceph_encode_64(&p, gid);
+	ceph_encode_64(&p, handle);
+	ceph_encode_64(&p, request_id);
+	ceph_encode_64(&p, offset);
+	ceph_encode_64(&p, total);
+
+	rbd_proxy_notify(rbd_dev, reply, message_len);
+	kfree(reply);
 }
 
 /*
@@ -5946,6 +6223,23 @@ static int rbd_unlock(struct rbd_device *rbd_dev)
 {
 	int ret;
 	char *cookie;
+	unsigned long timeout = 0;
+
+	if (test_bit(RBD_DEV_FLAG_REMOVING, &rbd_dev->flags)) {
+		timeout = rbd_dev->rbd_client->client->osdc.client->options->
+			  mount_timeout;
+	}
+
+	ret = rbd_flush_async_ops(rbd_dev, timeout);
+
+	if (ret == -ETIMEDOUT) {
+		rbd_warn(rbd_dev, "timed out flushing async ops, canceling");
+		rbd_cancel_async_ops(rbd_dev);
+		ret = rbd_flush_async_ops(rbd_dev, timeout);
+	}
+
+	if (ret)
+		return ret;
 
 	cookie = kasprintf(GFP_NOIO, "%s %llu", RBD_LOCK_COOKIE_PREFIX,
 			   rbd_dev->watch_handle->linger_id);
@@ -6045,6 +6339,8 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 		if (rc)
 			goto err_out_rbd_dev;
 	}
+
+	INIT_LIST_HEAD(&rbd_dev->async_ops);
 
 	rc = rbd_dev_device_setup(rbd_dev);
 	if (rc) {
@@ -6298,11 +6594,17 @@ static int __init rbd_init(void)
 		goto err_out_slab;
 	}
 
+	rbd_async_wq = alloc_workqueue(RBD_DRV_NAME "_async", WQ_UNBOUND, 0);
+	if (!rbd_async_wq) {
+		rc = -ENOMEM;
+		goto err_out_wq;
+	}
+
 	if (single_major) {
 		rbd_major = register_blkdev(0, RBD_DRV_NAME);
 		if (rbd_major < 0) {
 			rc = rbd_major;
-			goto err_out_wq;
+			goto err_out_async_wq;
 		}
 	}
 
@@ -6320,6 +6622,8 @@ static int __init rbd_init(void)
 err_out_blkdev:
 	if (single_major)
 		unregister_blkdev(rbd_major, RBD_DRV_NAME);
+err_out_async_wq:
+	destroy_workqueue(rbd_async_wq);
 err_out_wq:
 	destroy_workqueue(rbd_wq);
 err_out_slab:
@@ -6334,6 +6638,7 @@ static void __exit rbd_exit(void)
 	if (single_major)
 		unregister_blkdev(rbd_major, RBD_DRV_NAME);
 	destroy_workqueue(rbd_wq);
+	destroy_workqueue(rbd_async_wq);
 	rbd_slab_exit();
 }
 
