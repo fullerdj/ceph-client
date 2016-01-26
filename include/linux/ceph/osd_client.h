@@ -118,6 +118,9 @@ struct ceph_osd_req_op {
 			struct ceph_osd_data response_data;
 		} list_watchers;
 		struct {
+			struct ceph_osd_data response_data;
+		} list_snaps;
+		struct {
 			u64 cookie;
 			struct ceph_osd_data request_data;
 			struct ceph_osd_data response_data;
@@ -354,6 +357,13 @@ void osd_req_op_list_watchers_response_data_pages(
 					       u64 length, u32 alignment,
 					       bool pages_from_pool,
 					       bool own_pages);
+void osd_req_op_list_snaps_response_data_pages(
+					     struct ceph_osd_request *osd_req,
+					     unsigned int which,
+					     struct page **pages,
+					     u64 length, u32 alignment,
+					     bool pages_from_pool,
+					     bool own_pages);
 extern void osd_req_op_notify_init(struct ceph_osd_request *osd_req,
 				   unsigned int which, u16 opcode, u64 cookie);
 extern void osd_req_op_cls_init(struct ceph_osd_request *osd_req,
