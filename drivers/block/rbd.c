@@ -605,6 +605,7 @@ static void rbd_object_map_update(struct rbd_device *rbd_dev,
 				  u8 new_state,
 				  void (*cb)(struct rbd_obj_request *),
 				  struct rbd_obj_request *arg);
+static int rbd_object_map_resize(struct rbd_device *rbd_dev, u64 size);
 static int rbd_invalidate_object_map(struct rbd_device *rbd_dev);
 static void rbd_progress_async_op(struct rbd_async_op *op);
 static void rbd_notify_async_progress(struct work_struct *work);
@@ -1875,6 +1876,12 @@ static void rbd_osd_discard_callback(struct rbd_obj_request *obj_request)
 	obj_request_done_set(obj_request);
 }
 
+static void rbd_osd_complete_delete(struct rbd_obj_request *obj_request)
+{
+	rbd_osd_discard_callback(obj_request);
+	rbd_obj_request_complete(obj_request);
+}
+
 /*
  * For a simple stat call there's nothing to do.  We'll do more if
  * this is part of a write sequence for a layered image.
@@ -1893,6 +1900,32 @@ static void rbd_osd_call_callback(struct rbd_obj_request *obj_request)
 		rbd_osd_copyup_callback(obj_request);
 	else
 		obj_request_done_set(obj_request);
+}
+
+static void rbd_osd_delete_callback(struct rbd_obj_request *obj_request)
+{
+	struct rbd_device *rbd_dev;
+	u64 object_no;
+	u8 current_state;
+
+	if (!obj_request->img_request) {
+		rbd_osd_discard_callback(obj_request);
+		return;
+	}
+
+	rbd_dev = obj_request->img_request->rbd_dev;
+
+	if (!rbd_use_object_map(rbd_dev)) {
+		rbd_osd_discard_callback(obj_request);
+		return;
+	}
+
+	object_no = obj_request->img_offset >> rbd_dev->header.obj_order;
+	current_state = rbd_object_map_get(rbd_dev, object_no);
+
+	rbd_object_map_update(rbd_dev, object_no, current_state,
+			      RBD_OBJECT_NONEXISTENT, rbd_osd_complete_delete,
+			      obj_request);
 }
 
 static void rbd_osd_req_callback(struct ceph_osd_request *osd_req)
@@ -1937,6 +1970,8 @@ static void rbd_osd_req_callback(struct ceph_osd_request *osd_req)
 		rbd_osd_stat_callback(obj_request);
 		break;
 	case CEPH_OSD_OP_DELETE:
+		rbd_osd_delete_callback(obj_request);
+		break;
 	case CEPH_OSD_OP_TRUNCATE:
 	case CEPH_OSD_OP_ZERO:
 		rbd_osd_discard_callback(obj_request);
@@ -3205,6 +3240,11 @@ static void rbd_send_object_map_update(struct rbd_obj_request *obj_request)
 
 static int rbd_img_obj_request_submit(struct rbd_obj_request *obj_request)
 {
+	if (rbd_needs_object_map_update(obj_request)) {
+		rbd_send_object_map_update(obj_request);
+		return 0;
+	}
+
 	if (img_obj_request_simple(obj_request)) {
 		struct rbd_device *rbd_dev;
 		struct ceph_osd_client *osdc;
@@ -3832,7 +3872,15 @@ static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
 	if (ret)
 		goto out;
 
-	ret = rbd_dev_refresh(rbd_dev);
+	if (rbd_use_object_map(rbd_dev)) {
+		ret = rbd_object_map_resize(rbd_dev, size);
+		if (ret) {
+			rbd_warn(rbd_dev, "error %d resizing object map", ret);
+			rbd_invalidate_object_map(rbd_dev);
+		}
+	}
+
+	rbd_dev_refresh(rbd_dev);
 	if (ret)
 		goto out;
 
@@ -3904,6 +3952,12 @@ static int rbd_handle_snap_create(struct rbd_device *rbd_dev, void *start,
 		goto free_page;
 
 	ret = rbd_dev_v2_snap_context(rbd_dev);
+
+	if (rbd_use_object_map(rbd_dev)) {
+		ret = rbd_object_map_snap_create(rbd_dev, snapid);
+		if (ret)
+			goto free_page;
+	}
 
 	if (!ret)
 		rbd_warn(rbd_dev, "created snapshot %s@%s",
@@ -4899,6 +4953,144 @@ err:
 	return -ERANGE;
 }
 
+static void rbd_object_map_rebuild_header(struct rbd_device *rbd_dev,
+					  u64 object_count)
+
+{
+	u32 len;
+	void *p = rbd_dev->object_map_data;
+
+	len = CEPH_ENCODING_START_BLK_LEN + sizeof(u64);
+
+	rbd_assert(rbd_dev->object_map_data);
+	ceph_encode_32(&p, len);
+	ceph_start_encoding(&p, 1, 1, sizeof(u64));
+	ceph_encode_64(&p, object_count);
+
+	p = rbd_dev->object_map_data + rbd_dev->object_map_len - 4;
+	/* p now points to the footer bufferlist length. The footer is only
+	 * present in the on-disk version, so it has length 0. Encode the 0
+	 * here so the server will decode it correctly. */
+	ceph_encode_32(&p, 0);
+}
+
+static int rbd_object_map_resize(struct rbd_device *rbd_dev, u64 size)
+{
+	struct page *req_data;
+	size_t req_len;
+	u64 object_count;
+	u8 default_state = RBD_OBJECT_NONEXISTENT;
+	u64 image_size;
+	u64 new_size;
+	unsigned char *tmp;
+	void *p;
+	int i;
+	int ret;
+
+	if (size == 0)
+		object_count = 0;
+	else
+		object_count = ((size - 1) >> rbd_dev->header.obj_order) + 1;
+
+	new_size = rbd_object_map_bytes(object_count);
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data)
+		return -ENOMEM;
+
+	req_len = sizeof(object_count) + sizeof(default_state);
+
+	p = page_address(req_data);
+	ceph_encode_64(&p, object_count);
+	ceph_encode_8(&p, default_state);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->object_map_name,
+				 "rbd", "object_map_resize",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 &req_data, req_len, NULL, NULL);
+
+	if (ret)
+		goto out;
+
+	down_read(&rbd_dev->header_rwsem);
+	image_size = rbd_dev->header.image_size;
+	up_read(&rbd_dev->header_rwsem);
+
+	down_write(&rbd_dev->object_map_rwsem);
+	tmp = krealloc(rbd_dev->object_map_data, new_size, GFP_NOIO);
+	if (!tmp) {
+		up_write(&rbd_dev->object_map_rwsem);
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	rbd_dev->object_map_data = tmp;
+	rbd_dev->object_map_len = new_size;
+
+	rbd_object_map_rebuild_header(rbd_dev, object_count);
+	for (i = (image_size >> rbd_dev->header.obj_order) + 1;
+	     i < object_count;
+	     i++)
+		__rbd_object_map_set(rbd_dev, i, RBD_OBJECT_NONEXISTENT);
+	up_write(&rbd_dev->object_map_rwsem);
+
+out:
+	dout("%s new size %llu map size %llu returned %d\n", __func__,
+	     object_count, rbd_dev->object_map_len, ret);
+	__free_page(req_data);
+	return ret;
+}
+
+static int rbd_object_map_snap_create(struct rbd_device *rbd_dev, u64 snapid)
+{
+	char *object_name;
+	u64 alloc_size;
+	u64 obj_size;
+	void *object_map_data;
+	int ret;
+
+	/* We use PAGE_SIZE here to represent the footer size
+	 * because we don't know the actual size that we are going to
+	 * read. */
+
+	alloc_size = rbd_object_map_size(rbd_dev) + PAGE_SIZE;
+
+	object_map_data = kmalloc(alloc_size, GFP_NOIO);
+	if (!object_map_data)
+		return -ENOMEM;
+
+	ret = rbd_obj_read_sync(rbd_dev, rbd_dev->object_map_name,
+				0, alloc_size, object_map_data);
+
+	if (ret < 0)
+		goto out;
+
+	obj_size = ret;
+
+	dout("%s: read %llu byte object map copy\n", __func__, obj_size);
+
+	object_name = rbd_object_map_name(rbd_dev, snapid);
+	if (!object_name) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = rbd_obj_write_sync(rbd_dev, object_name,
+				 0, obj_size, object_map_data);
+
+	dout("%s: wrote %d bytes to %s\n", __func__, ret, object_name);
+
+	if (ret > 0)
+		ret = 0;
+
+	kfree(object_name);
+out:
+	kfree(object_map_data);
+	return ret;
+}
+
 /*
  * Clear the rbd device's EXISTS flag if the snapshot it's mapped to
  * has disappeared from the (just updated) snapshot context.
@@ -4965,8 +5157,12 @@ static int rbd_dev_refresh(struct rbd_device *rbd_dev)
 		rbd_exists_validate(rbd_dev);
 	}
 
-	if (rbd_dev->image_format == 2)
+	if (rbd_dev->image_format == 2) {
 		ret = rbd_dev_v2_features(rbd_dev);
+		if (ret)
+			goto out;
+		ret = rbd_object_map_init(rbd_dev);
+	}
 
 out:
 	up_write(&rbd_dev->header_rwsem);
@@ -7121,6 +7317,12 @@ out:
 	return ret;
 }
 
+static void rbd_object_map_free(struct rbd_device *rbd_dev)
+{
+	kfree(rbd_dev->object_map_name);
+	kfree(rbd_dev->object_map_data);
+}
+
 static ssize_t do_rbd_add(struct bus_type *bus,
 			  const char *buf,
 			  size_t count)
@@ -7197,6 +7399,10 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 
 	INIT_LIST_HEAD(&rbd_dev->async_ops);
 	rbd_dev->spec->ctx_flags = 0;
+
+	rc = rbd_object_map_init(rbd_dev);
+	if (rc)
+		goto err_out_rbd_dev;
 
 	rc = rbd_dev_device_setup(rbd_dev);
 	if (rc) {
@@ -7330,6 +7536,8 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 	if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED)
 		rbd_unlock(rbd_dev);
 	rbd_dev_header_unwatch_sync(rbd_dev);
+
+	rbd_object_map_free(rbd_dev);
 
 	/*
 	 * Don't free anything from rbd_dev->disk until after all
