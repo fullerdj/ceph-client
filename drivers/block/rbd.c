@@ -4630,6 +4630,45 @@ static ssize_t rbd_image_refresh(struct device *dev,
 	return size;
 }
 
+static ssize_t rbd_async_show(struct device *dev,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	struct rbd_device *rbd_dev = dev_to_rbd_dev(dev);
+	struct rbd_async_op *op;
+	size_t offset = 0;
+
+	down_read(&rbd_dev->lock_rwsem);
+	list_for_each_entry(op, &rbd_dev->async_ops, ops_entry) {
+		offset += scnprintf(buf+offset, PAGE_SIZE,
+				    "op [%llu,%llu,%llu] %llu / %llu (%d)\n",
+				    op->gid, op->handle, op->request_id,
+				    op->cur_byte, rbd_dev->parent_overlap,
+				    op->remaining);
+	}
+	up_read(&rbd_dev->lock_rwsem);
+	return offset;
+}
+
+static ssize_t rbd_async_do(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf,
+			    size_t size)
+{
+	struct rbd_device *rbd_dev = dev_to_rbd_dev(dev);
+	int ret = 0;
+
+	if (size >= 5 && !strncmp(buf, "cancel", 5))
+		rbd_cancel_async_ops(rbd_dev);
+	else
+		ret = rbd_flush_async_ops(rbd_dev, 0);
+
+	if (ret)
+		return ret;
+
+	return size;
+}
+
 static DEVICE_ATTR(size, S_IRUGO, rbd_size_show, NULL);
 static DEVICE_ATTR(features, S_IRUGO, rbd_features_show, NULL);
 static DEVICE_ATTR(major, S_IRUGO, rbd_major_show, NULL);
@@ -4642,6 +4681,7 @@ static DEVICE_ATTR(image_id, S_IRUGO, rbd_image_id_show, NULL);
 static DEVICE_ATTR(refresh, S_IWUSR, NULL, rbd_image_refresh);
 static DEVICE_ATTR(current_snap, S_IRUGO, rbd_snap_show, NULL);
 static DEVICE_ATTR(parent, S_IRUGO, rbd_parent_show, NULL);
+static DEVICE_ATTR(async, S_IRUGO | S_IWUSR, rbd_async_show, rbd_async_do);
 
 static struct attribute *rbd_attrs[] = {
 	&dev_attr_size.attr,
@@ -4656,6 +4696,7 @@ static struct attribute *rbd_attrs[] = {
 	&dev_attr_current_snap.attr,
 	&dev_attr_parent.attr,
 	&dev_attr_refresh.attr,
+	&dev_attr_async.attr,
 	NULL
 };
 
