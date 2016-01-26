@@ -126,12 +126,20 @@ static int atomic_dec_return_safe(atomic_t *v)
 #define RBD_FEATURE_LAYERING	(1<<0)
 #define RBD_FEATURE_STRIPINGV2	(1<<1)
 #define RBD_FEATURE_EXCLUSIVE_LOCK (1<<2)
+#define RBD_FEATURE_OBJECT_MAP	(1<<3)
 #define RBD_FEATURES_ALL \
 	    (RBD_FEATURE_LAYERING | RBD_FEATURE_STRIPINGV2 | \
-	     RBD_FEATURE_EXCLUSIVE_LOCK)
+	     RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_OBJECT_MAP)
 
 #define RBD_FLAG_OBJECT_MAP_INVALID (1<<0)
 #define RBD_FLAG_FAST_DIFF_INVALID (1<<1)
+
+#define RBD_OBJECT_MAP_HEADER_LEN 18
+
+#define RBD_OBJECT_NONEXISTENT  0
+#define RBD_OBJECT_EXISTS  1
+#define RBD_OBJECT_PENDING  2
+#define RBD_OBJECT_EXISTS_CLEAN  3
 
 /* Features supported by this (client software) implementation. */
 
@@ -367,6 +375,11 @@ struct rbd_device {
 	struct ceph_object_id	header_oid;
 	struct ceph_object_locator header_oloc;
 
+	char			*object_map_name;
+	unsigned char		*object_map_data;
+	struct rw_semaphore	object_map_rwsem;
+	u64			object_map_len;
+
 	struct ceph_file_layout	layout;
 
 	struct ceph_osd_linger_request *watch_handle;
@@ -582,6 +595,17 @@ static int rbd_dev_v2_features(struct rbd_device *rbd_dev);
 static int _rbd_dev_v2_snap_features(struct rbd_device *rbd_dev, u64 snap_id,
 		u64 *snap_features);
 
+static bool rbd_use_object_map(struct rbd_device *rbd_dev);
+static int rbd_object_map_init(struct rbd_device *rbd_dev);
+static u8 rbd_object_map_get(struct rbd_device *rbd_dev, u64 object_no);
+static u8 __rbd_object_map_get(struct rbd_device *rbd_dev, u64 object_no);
+static int rbd_object_map_snap_create(struct rbd_device *rbd_dev, u64 snapid);
+static void rbd_object_map_update(struct rbd_device *rbd_dev,
+				  u64 object_no, u8 current_state,
+				  u8 new_state,
+				  void (*cb)(struct rbd_obj_request *),
+				  struct rbd_obj_request *arg);
+static int rbd_invalidate_object_map(struct rbd_device *rbd_dev);
 static void rbd_progress_async_op(struct rbd_async_op *op);
 static void rbd_notify_async_progress(struct work_struct *work);
 static int rbd_handle_flatten(struct rbd_device *rbd_dev,
@@ -2200,10 +2224,178 @@ static bool rbd_dev_parent_get(struct rbd_device *rbd_dev)
 	return counter > 0;
 }
 
+static bool rbd_use_object_map(struct rbd_device *rbd_dev)
+{
+	return (rbd_dev->header.features & RBD_FEATURE_OBJECT_MAP &&
+		rbd_dev->object_map_data);
+}
+
+static bool rbd_object_map_valid(struct rbd_device *rbd_dev)
+{
+	return !(rbd_dev->spec->ctx_flags & RBD_FLAG_OBJECT_MAP_INVALID);
+}
+
+static void __rbd_object_map_set(struct rbd_device *rbd_dev, u64 object_no,
+				 u8 new_state);
+static void rbd_object_map_set(struct rbd_device *rbd_dev, u64 object_no,
+			       u8 new_state);
+
+struct map_update_work {
+	struct work_struct work;
+	struct rbd_device *rbd_dev;
+	u64 object_no;
+	u8 current_state;
+	u8 new_state;
+	void (*cb)(struct rbd_obj_request *);
+	struct rbd_obj_request *arg;
+};
+
 struct rbd_async_work {
 	struct work_struct work;
 	struct rbd_async_op *op;
 };
+
+static int rbd_do_object_map_update(struct rbd_device *rbd_dev,
+				    u64 start_object_no,
+				    u64 end_object_no, bool guard,
+				    u8 current_state, u8 new_state)
+{
+	struct page *req_data;
+	struct ceph_osd_client *osdc;
+	void *p;
+	size_t msg_len;
+	int ret = 0;
+	int i;
+
+	if (rbd_object_map_valid(rbd_dev)) {
+		osdc = &rbd_dev->rbd_client->client->osdc;
+
+		req_data = alloc_page(GFP_NOIO);
+		if (!req_data)
+			return -ENOMEM;
+
+		p = page_address(req_data);
+
+		msg_len = sizeof(start_object_no) + sizeof(end_object_no) +
+			sizeof(new_state) + ceph_sizeof_optional();
+
+		ceph_encode_64(&p, start_object_no);
+		ceph_encode_64(&p, end_object_no);
+		ceph_encode_8(&p, new_state);
+		ceph_encode_optional(&p, guard);
+		if (guard) {
+			msg_len += sizeof(current_state);
+			ceph_encode_8(&p, current_state);
+		}
+
+		ret = ceph_osdc_cls_call(osdc, rbd_dev->spec->pool_id,
+					 rbd_dev->object_map_name,
+					 "rbd", "object_map_update",
+					 CEPH_OSD_FLAG_WRITE |
+					 CEPH_OSD_FLAG_ONDISK,
+					 &req_data, msg_len, NULL, 0);
+
+		__free_page(req_data);
+
+		dout("%s len %llu: %llu-%llu = %u: %d\n", __func__,
+		     rbd_dev->object_map_len, start_object_no, end_object_no,
+		     new_state, ret);
+	}
+
+	if (!ret) {
+		down_write(&rbd_dev->object_map_rwsem);
+		for (i = start_object_no; i < end_object_no; i++)
+			if (guard &&
+			    __rbd_object_map_get(rbd_dev, i) == current_state)
+				__rbd_object_map_set(rbd_dev, i, new_state);
+		up_write(&rbd_dev->object_map_rwsem);
+	} else {
+		rbd_invalidate_object_map(rbd_dev);
+	}
+
+	return ret;
+}
+
+static inline int __calc_new_state(struct rbd_obj_request *obj_request,
+				   int current_state)
+{
+	struct rbd_img_request *img_request = obj_request->img_request;
+	struct rbd_device *rbd_dev = img_request->rbd_dev;
+	u64 object_size = rbd_obj_bytes(&rbd_dev->header);
+	u64 offset = obj_request->offset;
+	u64 length = obj_request->length;
+
+	if (img_request_write_test(obj_request->img_request)) {
+		return RBD_OBJECT_EXISTS;
+	} else if (img_request_discard_test(obj_request->img_request)) {
+		if (!offset && length == object_size &&
+		    (!img_request_layered_test(img_request) ||
+		     !obj_request_overlaps_parent(obj_request))) {
+			return RBD_OBJECT_PENDING;
+		}
+		return RBD_OBJECT_EXISTS;
+	} else {
+		return current_state;
+	}
+}
+
+static bool rbd_needs_object_map_update(struct rbd_obj_request *obj_request)
+{
+	struct rbd_device *rbd_dev = obj_request->img_request->rbd_dev;
+
+	u64 object_no;
+	u8 current_state;
+	u8 new_state;
+
+	if (!rbd_use_object_map(rbd_dev))
+		return 0;
+
+	object_no = obj_request->img_offset >> rbd_dev->header.obj_order;
+	current_state = rbd_object_map_get(rbd_dev, object_no);
+	new_state = __calc_new_state(obj_request, current_state);
+
+	dout("%s %llu: %u -> %u\n", __func__,
+	     object_no, current_state, new_state);
+
+	return current_state != new_state;
+}
+
+static void do_map_update_work(struct work_struct *work)
+{
+	struct map_update_work *update_work =
+		container_of(work, struct map_update_work, work);
+
+	rbd_do_object_map_update(update_work->rbd_dev, update_work->object_no,
+				 update_work->object_no+1,
+				 true, update_work->current_state,
+				 update_work->new_state);
+	update_work->cb(update_work->arg);
+
+	kfree(update_work);
+}
+
+static void rbd_object_map_update(struct rbd_device *rbd_dev,
+				  u64 object_no,
+				  u8 current_state,
+				  u8 new_state,
+				  void (*cb)(struct rbd_obj_request *),
+				  struct rbd_obj_request *arg)
+{
+	struct map_update_work *work = kmalloc(sizeof(struct map_update_work),
+					       GFP_NOIO);
+
+	rbd_assert(rbd_use_object_map(rbd_dev));
+
+	INIT_WORK(&work->work, do_map_update_work);
+	work->rbd_dev = rbd_dev;
+	work->object_no = object_no;
+	work->current_state = current_state;
+	work->new_state = new_state;
+	work->cb = cb;
+	work->arg = arg;
+
+	queue_work(rbd_async_wq, &work->work);
+}
 
 /*
  * Caller is responsible for filling in the list of object requests
@@ -2991,6 +3183,26 @@ static bool img_obj_request_simple(struct rbd_obj_request *obj_request)
 	return false;
 }
 
+static void __rbd_img_obj_request_submit(struct rbd_obj_request *obj_request)
+{
+	rbd_img_obj_request_submit(obj_request);
+}
+
+static void rbd_send_object_map_update(struct rbd_obj_request *obj_request)
+{
+	struct rbd_device *rbd_dev = obj_request->img_request->rbd_dev;
+	u64 object_no = obj_request->img_offset >> rbd_dev->header.obj_order;
+
+	u8 current_state = rbd_object_map_get(rbd_dev, object_no);
+	u8 new_state = __calc_new_state(obj_request, current_state);
+
+	if (new_state != current_state)
+		rbd_object_map_update(rbd_dev, object_no,
+				      current_state, new_state,
+				      __rbd_img_obj_request_submit,
+				      obj_request);
+}
+
 static int rbd_img_obj_request_submit(struct rbd_obj_request *obj_request)
 {
 	if (img_obj_request_simple(obj_request)) {
@@ -3143,6 +3355,63 @@ out_err:
 
 static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev);
 static void __rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev);
+
+static char *rbd_object_map_name(struct rbd_device *rbd_dev, u64 snap_id)
+{
+	if (snap_id == CEPH_NOSNAP)
+		return kasprintf(GFP_NOIO, "%s%s",
+				 RBD_OBJECT_MAP_PREFIX,
+				 rbd_dev->spec->image_id);
+	else
+		return kasprintf(GFP_NOIO, "%s%s.%016llx",
+				 RBD_OBJECT_MAP_PREFIX,
+				 rbd_dev->spec->image_id,
+				 snap_id);
+}
+
+static u64 rbd_object_map_bytes(u64 num_objects)
+{
+	/* The object map is encoded as:
+	 *
+	 * > 6 byte encoding header   } this portion is fixed with a member
+	 * > 8 byte message size      } function represented by
+	 * > 4 byte bufferlist len    } RBD_OBJECT_MAP_HEADER_LEN here
+	 *
+	 * > 2 bits per object, packed (the data)
+	 *
+	 * > 4 byte bufferlist len for empty bufferlist of data crcs
+	 */
+
+	if (num_objects == 0)
+		return RBD_OBJECT_MAP_HEADER_LEN + sizeof(u32);
+	else
+		return RBD_OBJECT_MAP_HEADER_LEN + (num_objects >> 2) +
+			((num_objects % 4) ? 1 : 0) + sizeof(u32);
+}
+
+static u64 __rbd_object_map_size(struct rbd_device *rbd_dev)
+{
+	u64 image_size;
+
+	image_size = rbd_dev->header.image_size;
+
+	if (image_size == 0)
+		return rbd_object_map_bytes(0);
+
+	return rbd_object_map_bytes(((image_size - 1) >>
+				     rbd_dev->header.obj_order) + 1);
+}
+
+static u64 rbd_object_map_size(struct rbd_device *rbd_dev)
+{
+	u64 ret;
+
+	down_read(&rbd_dev->header_rwsem);
+	ret = __rbd_object_map_size(rbd_dev);
+	up_read(&rbd_dev->header_rwsem);
+
+	return ret;
+}
 
 static int rbd_get_flags(struct rbd_device *rbd_dev, uint64_t *pflags)
 {
@@ -6630,6 +6899,225 @@ static int rbd_unlock(struct rbd_device *rbd_dev)
 
 	kfree(cookie);
 	up_write(&rbd_dev->lock_rwsem);
+	return ret;
+}
+
+static int rbd_invalidate_object_map(struct rbd_device *rbd_dev)
+{
+	rbd_dev->spec->ctx_flags |= RBD_FLAG_OBJECT_MAP_INVALID;
+	return rbd_set_flags(rbd_dev, RBD_FLAG_OBJECT_MAP_INVALID,
+			     RBD_FLAG_OBJECT_MAP_INVALID);
+}
+
+static int rbd_object_map_load(struct rbd_device *rbd_dev)
+{
+	struct page **resp_pages;
+	u64 object_map_size;
+	u32 page_count;
+	size_t resp_len;
+	int ret;
+
+	object_map_size = __rbd_object_map_size(rbd_dev);
+	page_count = calc_pages_for(0, object_map_size);
+	resp_pages = ceph_alloc_page_vector(page_count, GFP_NOIO);
+	if (IS_ERR(resp_pages))
+		return PTR_ERR(resp_pages);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->object_map_name,
+				 "rbd", "object_map_load", CEPH_OSD_FLAG_READ,
+				 NULL, 0, resp_pages, &resp_len);
+
+	if (ret)
+		goto out;
+
+	if (resp_len != object_map_size) {
+		pr_warn("%s expecting size %llu got %ld\n",
+		     __func__, object_map_size, resp_len);
+		return -EINVAL;
+	}
+
+	dout("%s: read %ld byte object map\n", __func__, resp_len);
+
+	rbd_dev->object_map_data = kmalloc(resp_len, GFP_NOIO);
+	if (!rbd_dev->object_map_data) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ceph_copy_from_page_vector(resp_pages, rbd_dev->object_map_data,
+				   0, resp_len);
+	rbd_dev->object_map_len = resp_len;
+
+out:
+	ceph_release_page_vector(resp_pages, page_count);
+	if (ret) {
+		dout("invalidating object map\n");
+		rbd_invalidate_object_map(rbd_dev);
+	}
+	return ret;
+}
+
+static u8 __rbd_object_map_get(struct rbd_device *rbd_dev, u64 object_no)
+{
+	u64 map_loc;
+
+	u8 map_cell, cell_offset, mask;
+	u8 ret;
+
+	map_loc = object_no >> 0x02;
+
+	rbd_assert(map_loc + RBD_OBJECT_MAP_HEADER_LEN <
+		   rbd_dev->object_map_len);
+
+	map_cell = rbd_dev->object_map_data[map_loc+RBD_OBJECT_MAP_HEADER_LEN];
+
+	cell_offset = (object_no & 0x03) << 1;
+	mask = 0xc0 >> cell_offset;
+
+	ret = (map_cell & mask) >> (6 - cell_offset);
+	dout("%s: obj %llu map_loc %llu cell_loc %u cell 0x%x\n",
+	     __func__, object_no, map_loc, cell_offset, map_cell);
+
+	return ret;
+}
+
+static u8 rbd_object_map_get(struct rbd_device *rbd_dev, u64 object_no)
+{
+	u8 ret;
+
+	down_read(&rbd_dev->object_map_rwsem);
+	ret = __rbd_object_map_get(rbd_dev, object_no);
+	up_read(&rbd_dev->object_map_rwsem);
+
+	return ret;
+}
+
+static void __rbd_object_map_set(struct rbd_device *rbd_dev, u64 object_no,
+				 u8 new_state)
+{
+	u64 map_loc;
+
+	u8 map_cell, cell_offset, mask;
+	u8 tmp;
+
+	map_loc = object_no >> 0x02;
+
+	rbd_assert(map_loc + RBD_OBJECT_MAP_HEADER_LEN <
+		   rbd_dev->object_map_len);
+
+	map_cell = rbd_dev->object_map_data[map_loc+RBD_OBJECT_MAP_HEADER_LEN];
+	cell_offset = (object_no & 0x03) << 1;
+	mask = new_state << (6 - cell_offset);
+
+	tmp = rbd_dev->object_map_data[map_loc+RBD_OBJECT_MAP_HEADER_LEN];
+	tmp &= ~(0x03 << (6 - cell_offset));
+	tmp |= mask;
+	rbd_dev->object_map_data[map_loc+RBD_OBJECT_MAP_HEADER_LEN] = tmp;
+
+	dout("%s: change obj %llu map_loc %llu cell_loc %u 0x%x -> 0x%x\n",
+	     __func__, object_no, map_loc, cell_offset, map_cell, tmp);
+}
+
+static void rbd_object_map_set(struct rbd_device *rbd_dev, u64 object_no,
+			       u8 new_state)
+{
+	down_write(&rbd_dev->object_map_rwsem);
+	__rbd_object_map_set(rbd_dev, object_no, new_state);
+	up_write(&rbd_dev->object_map_rwsem);
+}
+
+static int rbd_object_map_init(struct rbd_device *rbd_dev)
+{
+	u64 flags;
+	int num_lockers = 0;
+	struct ceph_locker *lockers;
+	struct ceph_osd_client *osdc;
+	u8 lock_type;
+	char *tag;
+	int ret;
+
+	if (!(rbd_dev->header.features & RBD_FEATURE_OBJECT_MAP))
+		return 0;
+	if (rbd_dev->object_map_data)
+		return 0;
+
+	ret = rbd_get_flags(rbd_dev, &flags);
+	if (ret)
+		return ret;
+
+	rbd_dev->spec->ctx_flags = flags;
+
+	if (rbd_dev->spec->ctx_flags & RBD_FLAG_OBJECT_MAP_INVALID)
+		return 0;
+
+	rbd_dev->object_map_name = rbd_object_map_name(rbd_dev,
+						       rbd_dev->spec->snap_id);
+
+	if (!rbd_dev->object_map_name)
+		return -ENOMEM;
+
+	rbd_dev->object_map_len = 0;
+	osdc = &rbd_dev->rbd_client->client->osdc;
+start:
+	if (num_lockers) {
+		kfree(lockers);
+		kfree(tag);
+		num_lockers = 0;
+	}
+
+	ret = ceph_cls_lock(osdc, rbd_dev->spec->pool_id,
+			    rbd_dev->object_map_name, RBD_LOCK_NAME,
+			    CEPH_CLS_LOCK_EXCLUSIVE, "", "", "", 0);
+
+	if (ret != -EBUSY)
+		goto out;
+
+	ret = ceph_cls_lock_info(osdc, rbd_dev->spec->pool_id,
+				 rbd_dev->object_map_name, RBD_LOCK_NAME,
+				 &num_lockers, &lockers, &lock_type, &tag);
+
+	if (ret == -ENOENT)
+		goto start;
+
+	if (ret) {
+		rbd_warn(rbd_dev, "couldn't get object map lock info");
+		goto out;
+	}
+
+	if (num_lockers > 1) {
+		rbd_warn(rbd_dev, "object map lock state invalid");
+		ret = -EDEADLK;
+		goto out;
+	}
+
+	rbd_warn(rbd_dev, "object map locked by %s.%lld (tag %s)",
+		 ENTITY_NAME(lockers[0].id.name), tag);
+
+	ret = ceph_cls_break_lock(osdc, rbd_dev->spec->pool_id,
+				  rbd_dev->object_map_name, RBD_LOCK_NAME,
+				  lockers[0].id.name.type,
+				  lockers[0].id.name.num,
+				  lockers[0].id.cookie);
+	goto start;
+out:
+	if (num_lockers) {
+		kfree(lockers);
+		kfree(tag);
+	}
+
+	ret = rbd_get_flags(rbd_dev, &flags);
+
+	if (flags & RBD_FLAG_OBJECT_MAP_INVALID) {
+		rbd_warn(rbd_dev, "Can't map an image with an invalid object map. Rebuild the object map, then try again.");
+		return -EUCLEAN;
+	}
+
+	ret = rbd_object_map_load(rbd_dev);
+	if (!ret)
+		init_rwsem(&rbd_dev->object_map_rwsem);
+
 	return ret;
 }
 
