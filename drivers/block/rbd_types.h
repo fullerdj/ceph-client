@@ -90,6 +90,7 @@ enum rbd_notify_op {
 	RBD_NOTIFY_OP_RESIZE             = 7,
 	RBD_NOTIFY_OP_SNAP_CREATE        = 8,
 	RBD_NOTIFY_OP_SNAP_REMOVE        = 9,
+	RBD_NOTIFY_OP_REBUILD_OBJECT_MAP = 10,
 };
 
 enum rbd_lock_state {

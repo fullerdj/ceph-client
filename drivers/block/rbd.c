@@ -33,6 +33,7 @@
 #include <linux/ceph/mon_client.h>
 #include <linux/ceph/decode.h>
 #include <linux/ceph/cls_lock.h>
+#include <linux/ceph/list_snaps.h>
 #include <linux/parser.h>
 #include <linux/bsearch.h>
 
@@ -611,6 +612,8 @@ static void rbd_progress_async_op(struct rbd_async_op *op);
 static void rbd_notify_async_progress(struct work_struct *work);
 static int rbd_handle_flatten(struct rbd_device *rbd_dev,
 			      void *start, void *end);
+static int rbd_handle_rebuild_object_map(struct rbd_device *rbd_dev,
+					 void *start, void *end);
 
 static int rbd_open(struct block_device *bdev, fmode_t mode)
 {
@@ -4110,6 +4113,12 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 			rbd_warn(rbd_dev, "snap remove failed: %d", ret);
 		rbd_async_notify_ack(rbd_dev, notify_id, ret);
 		break;
+	case RBD_NOTIFY_OP_REBUILD_OBJECT_MAP:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		ret = rbd_handle_rebuild_object_map(rbd_dev, p, end);
+		if (ret)
+			rbd_warn(rbd_dev, "object map rebuild failed: %d", ret);
+		break;
 	default:
 		rbd_async_notify_ack(rbd_dev, notify_id, -ENOTSUPP);
 		rbd_warn(rbd_dev, "unsupported async operation %d", op);
@@ -4840,6 +4849,111 @@ err:
 	mutex_unlock(&op->mutex);
 }
 
+static u64 rbd_next_valid_snap_id(struct rbd_device *rbd_dev, u64 snapid)
+{
+	int i;
+	struct ceph_snap_context *snapc = rbd_dev->header.snapc;
+
+	for (i = snapc->num_snaps - 1; i >= 0; i--)
+		if (snapc->snaps[i] >= snapid)
+			return snapc->snaps[i];
+	return CEPH_NOSNAP;
+}
+
+static int rbd_rebuild_stat_object(struct rbd_device *rbd_dev, u64 byte)
+{
+	struct ceph_osd_client *osdc;
+	const char *object_name;
+	struct ceph_snap_list l;
+	struct ceph_clone_info *ci;
+	u64 from_snap_id;
+	u64 to_snap_id;
+	int ret = 0;
+	int i;
+
+	osdc = &rbd_dev->rbd_client->client->osdc;
+
+	object_name = rbd_segment_name(rbd_dev, byte);
+	if (!object_name)
+		return -ENOMEM;
+
+	ret = ceph_osd_op_list_snaps(osdc, rbd_dev->spec->pool_id,
+				     object_name, &l);
+
+	dout("%s checking %s\n", __func__, object_name);
+	rbd_segment_name_free(object_name);
+
+	if (ret == -ENOENT)
+		return RBD_OBJECT_NONEXISTENT;
+	else if (ret)
+		return ret;
+
+	for (i = 0; i < l.num_clones; i++) {
+		ci = &l.clones[i];
+		if (ci->cloneid == CEPH_NOSNAP) {
+			from_snap_id = rbd_next_valid_snap_id(rbd_dev,
+							      l.seq + 1);
+			to_snap_id = CEPH_NOSNAP;
+		} else {
+			from_snap_id = rbd_next_valid_snap_id(rbd_dev,
+							      ci->snaps[0]);
+			to_snap_id = ci->snaps[ci->num_snaps-1];
+
+		}
+
+		if (to_snap_id < rbd_dev->spec->snap_id)
+			continue;
+		else if (rbd_dev->spec->snap_id < from_snap_id)
+			break;
+
+		ret = RBD_OBJECT_EXISTS;
+		goto out;
+	}
+
+	ret = RBD_OBJECT_NONEXISTENT;
+
+out:
+	dout("%s ret = %d\n", __func__, ret);
+	ceph_destroy_snap_list(&l);
+	return ret;
+}
+
+static void rbd_rebuild_verify_object(struct work_struct *work)
+{
+	struct rbd_async_work *rebuild_work;
+	struct rbd_async_op *op;
+	struct rbd_device *rbd_dev;
+	u64 byte;
+	u64 step;
+	int ret;
+
+	rebuild_work = container_of(work, struct rbd_async_work, work);
+	op = rebuild_work->op;
+	kfree(rebuild_work);
+
+	rbd_dev = op->rbd_dev;
+
+	down_read(&rbd_dev->header_rwsem);
+	step = rbd_obj_bytes(&rbd_dev->header);
+	up_read(&rbd_dev->header_rwsem);
+
+	mutex_lock(&op->mutex);
+	byte = op->cur_byte;
+	op->cur_byte += step;
+	mutex_unlock(&op->mutex);
+
+	ret = rbd_rebuild_stat_object(rbd_dev, byte);
+	if (ret < 0) {
+		mutex_lock(&op->mutex);
+		op->result = ret;
+		mutex_unlock(&op->mutex);
+	} else {
+		rbd_object_map_set(rbd_dev, byte / step, ret);
+	}
+
+	rbd_progress_async_op(op);
+}
+
 static int rbd_remove_child(struct rbd_device *rbd_dev,
 			    struct rbd_spec *parent_spec)
 {
@@ -4948,6 +5062,106 @@ out:
 	kref_put(&op->kref, __release_async_op);
 	rbd_notify_async_complete(rbd_dev, gid, handle, request_id, ret);
 	rbd_warn(rbd_dev, "flatten complete");
+	return ret;
+err:
+	return -ERANGE;
+}
+
+static int rbd_object_map_save(struct rbd_device *rbd_dev)
+{
+	struct page **pages;
+	u64 size = rbd_dev->object_map_len;
+	u32 page_count = calc_pages_for(0, size);
+	int ret;
+
+	rbd_assert(rbd_dev->object_map_data);
+
+	pages = ceph_alloc_page_vector(page_count, GFP_NOIO);
+	if (IS_ERR(pages))
+		return PTR_ERR(pages);
+
+	ceph_copy_to_page_vector(pages, rbd_dev->object_map_data, 0, size);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->object_map_name,
+				 "rbd", "object_map_save",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 pages, size, NULL, 0);
+
+	dout("object map save returned %d\n", ret);
+	ceph_release_page_vector(pages, page_count);
+	return ret;
+}
+
+static int rbd_handle_rebuild_object_map(struct rbd_device *rbd_dev,
+					 void *start, void *end)
+{
+	u64 gid, handle, request_id;
+	struct rbd_async_op *op;
+	void *p;
+	u64 image_size;
+	u64 num_objects;
+	int ret;
+	int i;
+
+	dout("%s: async start\n", __func__);
+
+	p = start;
+	ceph_decode_64_safe(&p, end, gid, err);
+	ceph_decode_64_safe(&p, end, handle, err);
+	ceph_decode_64_safe(&p, end, request_id, err);
+
+	down_read(&rbd_dev->header_rwsem);
+	image_size = rbd_dev->header.image_size;
+	up_read(&rbd_dev->header_rwsem);
+
+	down_write(&rbd_dev->object_map_rwsem);
+
+	rbd_invalidate_object_map(rbd_dev);
+
+	num_objects = image_size >> rbd_dev->header.obj_order;
+	for (i = 0; i < num_objects; i++)
+		__rbd_object_map_set(rbd_dev, i, RBD_OBJECT_NONEXISTENT);
+
+	up_write(&rbd_dev->object_map_rwsem);
+
+	ceph_osdc_sync(&rbd_dev->rbd_client->client->osdc);
+
+	op = rbd_start_async_op(rbd_dev, 0, image_size,
+				gid, handle, request_id,
+				rbd_rebuild_verify_object);
+	if (IS_ERR(op)) {
+		if (PTR_ERR(op) == -EPERM || PTR_ERR(op) == -EEXIST)
+			return 0;
+		return PTR_ERR(op);
+	}
+
+	ret = wait_for_completion_interruptible(&op->done);
+	dout("%s, async op completed with result %d\n", __func__, ret);
+
+	if (ret)
+		goto out;
+
+	ret = rbd_object_map_save(rbd_dev);
+	if (ret)
+		goto out;
+
+	ret = rbd_set_flags(rbd_dev, 0, RBD_FLAG_OBJECT_MAP_INVALID);
+
+	down_write(&rbd_dev->lock_rwsem);
+	list_del(&op->ops_entry);
+	up_write(&rbd_dev->lock_rwsem);
+
+	if (op->result) {
+		ret = op->result;
+		goto out;
+	}
+
+out:
+	kref_put(&op->kref, __release_async_op);
+	rbd_notify_async_complete(rbd_dev, gid, handle, request_id, ret);
+	rbd_warn(rbd_dev, "object map rebuild complete");
 	return ret;
 err:
 	return -ERANGE;
