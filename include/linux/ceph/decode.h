@@ -217,6 +217,13 @@ static inline void ceph_encode_string(void **p, void *end,
 	*p += len;
 }
 
+static inline void ceph_encode_optional(void **p, u8 present)
+{
+	ceph_encode_8(p, present);
+}
+
+#define ceph_sizeof_optional() (sizeof(u8))
+
 /*
  * version and length starting block encoders/decoders
  */
