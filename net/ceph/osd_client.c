@@ -306,6 +306,22 @@ void osd_req_op_list_watchers_response_data_pages(
 }
 EXPORT_SYMBOL(osd_req_op_list_watchers_response_data_pages);
 
+void osd_req_op_list_snaps_response_data_pages(
+					     struct ceph_osd_request *osd_req,
+					     unsigned int which,
+					     struct page **pages,
+					     u64 length, u32 alignment,
+					     bool pages_from_pool,
+					     bool own_pages)
+{
+	struct ceph_osd_data *osd_data;
+	osd_data = osd_req_op_data(osd_req, which,
+				   list_watchers, response_data);
+	ceph_osd_data_pages_init(osd_data, pages, length, alignment,
+				 pages_from_pool, own_pages);
+}
+EXPORT_SYMBOL(osd_req_op_list_snaps_response_data_pages);
+
 static u64 ceph_osd_data_length(struct ceph_osd_data *osd_data)
 {
 	switch (osd_data->type) {
@@ -920,6 +936,10 @@ static u64 osd_req_encode_op(struct ceph_osd_request *req,
 		break;
 	case CEPH_OSD_OP_LIST_WATCHERS:
 		osd_data = &src->list_watchers.response_data;
+		ceph_osdc_msg_data_add(req->r_reply, osd_data);
+		break;
+	case CEPH_OSD_OP_LIST_SNAPS:
+		osd_data = &src->list_snaps.response_data;
 		ceph_osdc_msg_data_add(req->r_reply, osd_data);
 		break;
 	case CEPH_OSD_OP_SETALLOCHINT:
