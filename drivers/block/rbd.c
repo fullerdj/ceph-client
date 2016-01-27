@@ -128,9 +128,11 @@ static int atomic_dec_return_safe(atomic_t *v)
 #define RBD_FEATURE_STRIPINGV2	(1<<1)
 #define RBD_FEATURE_EXCLUSIVE_LOCK (1<<2)
 #define RBD_FEATURE_OBJECT_MAP	(1<<3)
+#define RBD_FEATURE_FAST_DIFF (1<<4)
 #define RBD_FEATURES_ALL \
 	    (RBD_FEATURE_LAYERING | RBD_FEATURE_STRIPINGV2 | \
-	     RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_OBJECT_MAP)
+	     RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_OBJECT_MAP | \
+	     RBD_FEATURE_FAST_DIFF)
 
 #define RBD_FLAG_OBJECT_MAP_INVALID (1<<0)
 #define RBD_FLAG_FAST_DIFF_INVALID (1<<1)
@@ -608,6 +610,7 @@ static void rbd_object_map_update(struct rbd_device *rbd_dev,
 				  struct rbd_obj_request *arg);
 static int rbd_object_map_resize(struct rbd_device *rbd_dev, u64 size);
 static int rbd_invalidate_object_map(struct rbd_device *rbd_dev);
+static int rbd_object_map_snap_update(struct rbd_device *rbd_dev);
 static void rbd_progress_async_op(struct rbd_async_op *op);
 static void rbd_notify_async_progress(struct work_struct *work);
 static int rbd_handle_flatten(struct rbd_device *rbd_dev,
@@ -2260,6 +2263,12 @@ static bool rbd_dev_parent_get(struct rbd_device *rbd_dev)
 		rbd_warn(rbd_dev, "parent reference overflow");
 
 	return counter > 0;
+}
+
+static bool rbd_use_fast_diff(struct rbd_device *rbd_dev)
+{
+	return (rbd_use_object_map(rbd_dev) &&
+		rbd_dev->header.features & RBD_FEATURE_FAST_DIFF);
 }
 
 static bool rbd_use_object_map(struct rbd_device *rbd_dev)
@@ -3962,6 +3971,12 @@ static int rbd_handle_snap_create(struct rbd_device *rbd_dev, void *start,
 			goto free_page;
 	}
 
+	if (rbd_use_fast_diff(rbd_dev)) {
+		ret = rbd_object_map_snap_update(rbd_dev);
+		if (ret)
+			goto free_page;
+	}
+
 	if (!ret)
 		rbd_warn(rbd_dev, "created snapshot %s@%s",
 			 rbd_dev->spec->image_name, snap_name);
@@ -4898,13 +4913,18 @@ static int rbd_rebuild_stat_object(struct rbd_device *rbd_dev, u64 byte)
 			from_snap_id = rbd_next_valid_snap_id(rbd_dev,
 							      ci->snaps[0]);
 			to_snap_id = ci->snaps[ci->num_snaps-1];
-
 		}
 
 		if (to_snap_id < rbd_dev->spec->snap_id)
 			continue;
 		else if (rbd_dev->spec->snap_id < from_snap_id)
 			break;
+
+		if (rbd_use_fast_diff(rbd_dev) &&
+		    from_snap_id != rbd_dev->spec->snap_id) {
+			ret = RBD_OBJECT_EXISTS_CLEAN;
+			goto out;
+		}
 
 		ret = RBD_OBJECT_EXISTS;
 		goto out;
@@ -5098,6 +5118,7 @@ static int rbd_handle_rebuild_object_map(struct rbd_device *rbd_dev,
 					 void *start, void *end)
 {
 	u64 gid, handle, request_id;
+	u64 flagmask;
 	struct rbd_async_op *op;
 	void *p;
 	u64 image_size;
@@ -5147,7 +5168,11 @@ static int rbd_handle_rebuild_object_map(struct rbd_device *rbd_dev,
 	if (ret)
 		goto out;
 
-	ret = rbd_set_flags(rbd_dev, 0, RBD_FLAG_OBJECT_MAP_INVALID);
+	flagmask = RBD_FLAG_OBJECT_MAP_INVALID;
+	if (rbd_use_fast_diff(rbd_dev))
+		flagmask |= RBD_FLAG_FAST_DIFF_INVALID;
+
+	ret = rbd_set_flags(rbd_dev, 0, flagmask);
 
 	down_write(&rbd_dev->lock_rwsem);
 	list_del(&op->ops_entry);
@@ -5303,6 +5328,41 @@ static int rbd_object_map_snap_create(struct rbd_device *rbd_dev, u64 snapid)
 out:
 	kfree(object_map_data);
 	return ret;
+}
+
+static int rbd_object_map_snap_update(struct rbd_device *rbd_dev)
+{
+	int ret;
+	int i;
+	u8 cur;
+	u64 image_size;
+
+	rbd_assert(rbd_use_fast_diff(rbd_dev));
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->object_map_name,
+				 "rbd", "object_map_snap_add",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 NULL, 0, NULL, NULL);
+
+	if (ret)
+		return ret;
+
+	down_read(&rbd_dev->header_rwsem);
+	image_size = rbd_dev->header.image_size;
+	up_read(&rbd_dev->header_rwsem);
+
+	down_write(&rbd_dev->object_map_rwsem);
+	for (i = 0; i < image_size >> rbd_dev->header.obj_order; i++) {
+		cur = __rbd_object_map_get(rbd_dev, i);
+		if (cur == RBD_OBJECT_EXISTS)
+			__rbd_object_map_set(rbd_dev, i,
+					     RBD_OBJECT_EXISTS_CLEAN);
+	}
+	up_write(&rbd_dev->object_map_rwsem);
+
+	return 0;
 }
 
 /*
@@ -7314,9 +7374,16 @@ static int rbd_unlock(struct rbd_device *rbd_dev)
 
 static int rbd_invalidate_object_map(struct rbd_device *rbd_dev)
 {
+	uint64_t mask = RBD_FLAG_OBJECT_MAP_INVALID;
+
 	rbd_dev->spec->ctx_flags |= RBD_FLAG_OBJECT_MAP_INVALID;
-	return rbd_set_flags(rbd_dev, RBD_FLAG_OBJECT_MAP_INVALID,
-			     RBD_FLAG_OBJECT_MAP_INVALID);
+
+	if (rbd_dev->header.features | RBD_FEATURE_FAST_DIFF) {
+		rbd_dev->spec->ctx_flags |= RBD_FLAG_FAST_DIFF_INVALID;
+		mask |= RBD_FLAG_FAST_DIFF_INVALID;
+	}
+
+	return rbd_set_flags(rbd_dev, rbd_dev->spec->ctx_flags, mask);
 }
 
 static int rbd_object_map_load(struct rbd_device *rbd_dev)
