@@ -618,6 +618,8 @@ static int rbd_handle_flatten(struct rbd_device *rbd_dev,
 			      void *start, void *end);
 static int rbd_handle_rebuild_object_map(struct rbd_device *rbd_dev,
 					 void *start, void *end);
+static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
+			  u64 request_id, u64 new_size);
 
 static int rbd_open(struct block_device *bdev, fmode_t mode)
 {
@@ -5404,11 +5406,12 @@ static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
 	rbd_assert(new_size < rbd_dev->header.image_size);
 
 	start_object = new_size >> rbd_dev->header.obj_order;
-	end_object = rbd_dev->header.image_size >> rbd_dev->header.obj_order;
+	end_object = (rbd_dev->header.image_size-1) >>
+		rbd_dev->header.obj_order;
 
 	dout("delete %llu/%llu - %llu/%llu\n",
-		new_size, start_object,
-		rbd_dev->header.image_size, end_object);
+	     new_size, start_object,
+	     rbd_dev->header.image_size, end_object);
 
 	/* This will mark the first object as PENDING even though it may
 	   only be partially zeroed. It will be marked RBD_OBJECT_EXISTS in
