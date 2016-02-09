@@ -2012,6 +2012,16 @@ static void rbd_osd_req_format_write(struct rbd_obj_request *obj_request)
 	osd_req->r_data_offset = obj_request->offset;
 }
 
+static void rbd_osd_req_format_snap_write(struct rbd_obj_request *obj_request,
+					  struct ceph_snap_context *snapc)
+{
+	struct ceph_osd_request *osd_req = obj_request->osd_req;
+
+	rbd_assert(osd_req != NULL);
+
+	osd_req->r_snapc = ceph_get_snap_context(snapc);
+}
+
 /*
  * Create an osd request.  A read request has one osd op (read).
  * A write request has either one (watch) or two (hint+write) osd ops.
@@ -4585,6 +4595,54 @@ out:
 	else
 		ceph_release_page_vector(pages, page_count);
 
+	return ret;
+}
+
+static int rbd_obj_delete_sync(struct rbd_device *rbd_dev,
+			       const char *object_name)
+{
+	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+	struct rbd_obj_request *obj_request;
+	int ret;
+
+	obj_request = rbd_obj_request_create(object_name, 0, 0,
+					     OBJ_REQUEST_NODATA);
+	if (!obj_request)
+		return -ENOMEM;
+
+	obj_request->pages = NULL;
+	obj_request->page_count = 0;
+
+	obj_request->osd_req = rbd_osd_req_create(rbd_dev, OBJ_OP_DISCARD, 1,
+						  obj_request);
+
+	if (!obj_request->osd_req) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	osd_req_op_init(obj_request->osd_req, 0, CEPH_OSD_OP_DELETE, 0);
+	rbd_osd_req_format_snap_write(obj_request, rbd_dev->header.snapc);
+
+	dout("delete %s obj_request %p\n", object_name, obj_request);
+
+	ret = rbd_obj_request_submit(osdc, obj_request);
+	if (ret)
+		goto out;
+
+	ret = rbd_obj_request_wait(obj_request);
+	if (ret)
+		goto out;
+
+	ret = obj_request->result;
+	dout("delete %s obj_request %p returned %d\n",
+	     object_name, obj_request, ret);
+	if (ret < 0)
+		goto out;
+
+	ret = 0;
+out:
+	rbd_obj_request_put(obj_request);
 	return ret;
 }
 
