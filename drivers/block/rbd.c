@@ -7499,6 +7499,12 @@ out:
 	return ret;
 }
 
+static void rbd_object_map_free(struct rbd_device *rbd_dev)
+{
+	kfree(rbd_dev->object_map_name);
+	kfree(rbd_dev->object_map_data);
+}
+
 static ssize_t do_rbd_add(struct bus_type *bus,
 			  const char *buf,
 			  size_t count)
@@ -7714,6 +7720,9 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 	 */
 	dout("%s: flushing notifies", __func__);
 	ceph_osdc_flush_notifies(&rbd_dev->rbd_client->client->osdc);
+
+	if (rbd_use_object_map(rbd_dev))
+		rbd_object_map_free(rbd_dev);
 
 	/*
 	 * Don't free anything from rbd_dev->disk until after all
