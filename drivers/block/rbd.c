@@ -1956,7 +1956,12 @@ static void rbd_osd_req_callback(struct ceph_osd_request *osd_req,
 	u16 opcode;
 
 	dout("%s: osd_req %p msg %p\n", __func__, osd_req, msg);
-	rbd_assert(osd_req == obj_request->osd_req);
+	//rbd_assert(osd_req == obj_request->osd_req);
+	if (osd_req != obj_request->osd_req) {
+		pr_warn("******* %p %p *******\n", osd_req,
+			obj_request->osd_req);
+		WARN_ON(1);
+	}
 	if (obj_request_img_data_test(obj_request)) {
 		rbd_assert(obj_request->img_request);
 		rbd_assert(obj_request->which != BAD_WHICH);
@@ -4816,8 +4821,9 @@ static int rbd_obj_delete_sync(struct rbd_device *rbd_dev,
 		goto out;
 	}
 
-	obj_request->osd_req->r_priv = obj_request;
+	//obj_request->osd_req->r_priv = obj_request;
 
+	ceph_get_snap_context(rbd_dev->header.snapc);
 	osd_req_op_init(obj_request->osd_req, 0, CEPH_OSD_OP_DELETE, 0);
 	rbd_osd_req_format_snap_write(obj_request, rbd_dev->header.snapc);
 
@@ -5417,12 +5423,14 @@ static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
 	   only be partially zeroed. It will be marked RBD_OBJECT_EXISTS in
 	   the write flow, then the guard below will avoid marking it
 	   RBD_OBJECT_NONEXISTENT. */
+	if (rbd_use_object_map(rbd_dev)) {
 	ret = rbd_do_object_map_update(rbd_dev,
 				       start_object, end_object + 1, false,
 				       0, RBD_OBJECT_PENDING);
 
 	if (ret)
 		goto out;
+		}
 
 	op = rbd_start_async_op(rbd_dev, new_size,
 				rbd_dev->header.image_size,
@@ -5446,10 +5454,12 @@ static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
 	if (ret)
 		goto out;
 
+		if (rbd_use_object_map(rbd_dev)) {
 	ret = rbd_do_object_map_update(rbd_dev,
 				       start_object, end_object + 1, true,
 				       RBD_OBJECT_PENDING,
 				       RBD_OBJECT_NONEXISTENT);
+			}
 
 out:
 	dout("%s, op returned %d\n", __func__, ret);
