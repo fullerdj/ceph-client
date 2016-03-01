@@ -1,4 +1,5 @@
-
+static int bug = 0;
+static int print = 0;
 /*
    rbd.c -- Export ceph rados objects as a Linux block device
 
@@ -1551,7 +1552,7 @@ static bool obj_request_overlaps_parent(struct rbd_obj_request *obj_request)
 static void rbd_obj_request_get(struct rbd_obj_request *obj_request)
 {
 	dout("%s: obj %p (was %d)\n", __func__, obj_request,
-		atomic_read(&obj_request->kref.refcount));
+	     atomic_read(&obj_request->kref.refcount));
 	kref_get(&obj_request->kref);
 }
 
@@ -1560,7 +1561,7 @@ static void rbd_obj_request_put(struct rbd_obj_request *obj_request)
 {
 	rbd_assert(obj_request != NULL);
 	dout("%s: obj %p (was %d)\n", __func__, obj_request,
-		atomic_read(&obj_request->kref.refcount));
+	     atomic_read(&obj_request->kref.refcount));
 	kref_put(&obj_request->kref, rbd_obj_request_destroy);
 }
 
@@ -1930,14 +1931,14 @@ static void rbd_osd_delete_callback(struct rbd_obj_request *obj_request)
 	u8 current_state;
 
 	if (!obj_request->img_request) {
-		rbd_osd_complete_delete(obj_request);
+		rbd_osd_discard_callback(obj_request);
 		return;
 	}
 
 	rbd_dev = obj_request->img_request->rbd_dev;
 
 	if (!rbd_use_object_map(rbd_dev)) {
-		rbd_osd_complete_delete(obj_request);
+		rbd_osd_discard_callback(obj_request);
 		return;
 	}
 
@@ -1961,6 +1962,7 @@ static void rbd_osd_req_callback(struct ceph_osd_request *osd_req,
 		pr_warn("******* %p %p *******\n", osd_req,
 			obj_request->osd_req);
 		WARN_ON(1);
+		bug = 1;
 	}
 	if (obj_request_img_data_test(obj_request)) {
 		rbd_assert(obj_request->img_request);
@@ -2204,7 +2206,8 @@ static void rbd_obj_request_destroy(struct kref *kref)
 
 	obj_request = container_of(kref, struct rbd_obj_request, kref);
 
-	dout("%s: obj %p\n", __func__, obj_request);
+	if (print)
+	pr_warn("%s: obj %p\n", __func__, obj_request);
 
 	rbd_assert(obj_request->img_request == NULL);
 	rbd_assert(obj_request->which == BAD_WHICH);
@@ -2450,6 +2453,8 @@ static void rbd_object_map_update(struct rbd_device *rbd_dev,
 {
 	struct map_update_work *work = kmalloc(sizeof(struct map_update_work),
 					       GFP_NOIO);
+
+	BUG_ON(!rbd_use_object_map(rbd_dev));
 
 	INIT_WORK(&work->work, do_map_update_work);
 	work->rbd_dev = rbd_dev;
@@ -3594,6 +3599,7 @@ static int rbd_send_async_notify(struct rbd_device *rbd_dev,
 	struct ceph_osd_request *osd_req;
 	struct ceph_osd_event *notify_event;
 	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
+	unsigned long completed;
 	int ret;
 
 	osd_req = ceph_osdc_alloc_request(osdc, NULL, 1, false, GFP_NOIO);
@@ -3628,9 +3634,11 @@ static int rbd_send_async_notify(struct rbd_device *rbd_dev,
 		goto cancel_event;
 	}
 
-	ceph_osdc_wait_event(osdc, notify_event);
-
-	ret = notify_event->notify.return_code;
+	completed = ceph_osdc_wait_event(osdc, notify_event);
+	if (!completed)
+		ret = -ETIMEDOUT;
+	else
+		ret = notify_event->notify.return_code;
 
 cancel_event:
 	ceph_osdc_cancel_event(notify_event);
@@ -3824,6 +3832,7 @@ static struct rbd_async_op *__alloc_async_op(struct rbd_device *rbd_dev,
 	if (!op)
 		return NULL;
 
+	dout("%s: %p\n", __func__, op);
 	kref_init(&op->kref);
 	op->rbd_dev = rbd_dev;
 	op->gid = gid;
@@ -4019,6 +4028,7 @@ static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
 			rbd_warn(rbd_dev, "error %d trimming image", ret);
 			goto out;
 		}
+		BUG_ON(bug);
 	}
 
 	if (rbd_use_object_map(rbd_dev)) {
@@ -4209,7 +4219,9 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 		op = RBD_NOTIFY_OP_HEADER_UPDATE;
 	}
 
-	dout("%s got async request: len %u op %u", __func__, len, op);
+	dout("%s got async request from %llu: id %llu len %u op %u (I am %lld)\n",
+	     __func__, notifier_id, notify_id, len, op,
+	     ceph_client_id(rbd_dev->rbd_client->client->osdc.client));
 
 	switch(op) {
 	case RBD_NOTIFY_OP_ACQUIRED_LOCK:
@@ -4235,9 +4247,11 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 		break;
 	case RBD_NOTIFY_OP_ASYNC_PROGRESS:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		if (ceph_client_id(rbd_dev->rbd_client->client->osdc.client) != notifier_id) {
 		ret = rbd_handle_async_progress(rbd_dev, p, end);
 		if (ret)
 			rbd_warn(rbd_dev, "async progress failed: %d", ret);
+		}
 		break;
 	case RBD_NOTIFY_OP_ASYNC_COMPLETE:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
@@ -4279,6 +4293,8 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 		rbd_warn(rbd_dev, "unsupported async operation %d", op);
 		break;
 	}
+
+	dout("%s: completed %llu\n", __func__, notify_id);
 
 	return;
 err:
@@ -4823,9 +4839,11 @@ static int rbd_obj_delete_sync(struct rbd_device *rbd_dev,
 
 	//obj_request->osd_req->r_priv = obj_request;
 
-	ceph_get_snap_context(rbd_dev->header.snapc);
+	//ceph_get_snap_context(rbd_dev->header.snapc);
 	osd_req_op_init(obj_request->osd_req, 0, CEPH_OSD_OP_DELETE, 0);
 	rbd_osd_req_format_snap_write(obj_request, rbd_dev->header.snapc);
+
+	dout("delete %s obj_request %p\n", object_name, obj_request);
 
 	ret = rbd_obj_request_submit(osdc, obj_request);
 	if (ret)
@@ -4836,6 +4854,7 @@ static int rbd_obj_delete_sync(struct rbd_device *rbd_dev,
 		goto out;
 
 	ret = obj_request->result;
+	dout("delete %s obj_request %p returned %d\n", object_name, obj_request, ret);
 	if (ret < 0)
 		goto out;
 
@@ -4920,6 +4939,7 @@ static void rbd_async_send_next(struct rbd_async_op *op)
 
 	async_work->op = op;
 	INIT_WORK(&async_work->work, op->workfn);
+	if (print) pr_warn("send next on %p work %p\n", op, &async_work->work);
 	queue_work(rbd_async_wq, &async_work->work);
 }
 
@@ -4927,14 +4947,15 @@ static void rbd_complete_async_op(struct rbd_async_op *op)
 {
 	int outstanding;
 
-	dout("%s: one complete", __func__);
 
 	mutex_lock(&op->mutex);
 	outstanding = --op->outstanding;
 	mutex_unlock(&op->mutex);
 
+	dout("%s: one complete, %d outstanding\n", __func__, outstanding);
+
 	if (!outstanding) {
-		dout("%s: all complete", __func__);
+		dout("%s: all complete\n", __func__);
 		complete_all(&op->done);
 	}
 }
@@ -4944,11 +4965,15 @@ static void rbd_progress_async_op(struct rbd_async_op *op)
 	int remaining;
 	int result = 0;
 
+	int outstanding;
+
 	mutex_lock(&op->mutex);
 	remaining = --op->remaining;
+	outstanding = op->outstanding;
 	if (op->result)
 		result = op->result;
 	mutex_unlock(&op->mutex);
+	if (print) pr_warn("progress, %d remaining %d outstanding\n", remaining, outstanding);
 
 	if (result || remaining < 0)
 		rbd_complete_async_op(op);
@@ -4965,6 +4990,7 @@ static struct rbd_async_op *rbd_start_async_op(
 	enum rbd_lock_state state;
 	struct rbd_async_op *op;
 	int i;
+	int outstanding;
 
 	down_read(&rbd_dev->lock_rwsem);
 	state = rbd_dev->lock_state;
@@ -4987,19 +5013,20 @@ static struct rbd_async_op *rbd_start_async_op(
 
 	kref_get(&op->kref);
 	op->cur_byte = start;
-	op->outstanding = min(RBD_MAX_ASYNC_OUTSTANDING, op->remaining);
+	outstanding = op->outstanding = min(RBD_MAX_ASYNC_OUTSTANDING, op->remaining);
 	dout("%d remaining\n", op->remaining);
 	op->workfn = workfn;
 
 	down_write(&rbd_dev->lock_rwsem);
 	list_add_tail(&op->ops_entry, &rbd_dev->async_ops);
 	up_write(&rbd_dev->lock_rwsem);
-
-	for (i = 0; i < op->outstanding; i++)
-		rbd_progress_async_op(op);
-
 	INIT_WORK(&op->progress_work, rbd_notify_async_progress);
-	queue_work(rbd_async_wq, &op->progress_work);
+
+	for (i = 0; i < outstanding; i++) {
+		rbd_progress_async_op(op);
+	}
+
+	//queue_work(rbd_async_wq, &op->progress_work);
 
 	return op;
 }
@@ -5025,8 +5052,10 @@ static int rbd_handle_async_progress(struct rbd_device *rbd_dev, void *start,
 	down_read(&rbd_dev->lock_rwsem);
 	op = __find_async_op(rbd_dev, gid, handle, request_id);
 	if (op) {
-		kref_get(&op->kref);
-		queue_work(rbd_async_wq, &op->progress_work);
+		if (!completion_done(&op->done)) {
+			kref_get(&op->kref);
+			queue_work(rbd_async_wq, &op->progress_work);
+		}
 	}
 	up_read(&rbd_dev->lock_rwsem);
 
@@ -5044,6 +5073,7 @@ static void rbd_notify_async_progress(struct work_struct *work)
 	u64 offset;
 	u64 total;
 	u32 message_len;
+	struct rbd_device *rbd_dev;
 	void *p;
 
 	struct rbd_async_op *op = container_of(work, struct rbd_async_op,
@@ -5053,7 +5083,8 @@ static void rbd_notify_async_progress(struct work_struct *work)
 	handle = op->handle;
 	request_id = op->request_id;
 	offset = op->cur_byte; /* read race */
-	total = op->rbd_dev->header.image_size;
+	rbd_dev = op->rbd_dev;
+	total = rbd_dev->header.image_size;
 	kref_put(&op->kref, __release_async_op);
 
 	message_len = sizeof(u32) + sizeof(gid) + sizeof(handle) +
@@ -5072,7 +5103,7 @@ static void rbd_notify_async_progress(struct work_struct *work)
 	ceph_encode_64(&p, offset);
 	ceph_encode_64(&p, total);
 
-	rbd_async_notify(op->rbd_dev, reply, message_len);
+	rbd_async_notify(rbd_dev, reply, message_len);
 	kfree(reply);
 }
 
@@ -5080,12 +5111,15 @@ static void rbd_img_async_progress(struct rbd_img_request *img_request)
 {
 	struct rbd_async_op *op = img_request->async_op;
 
+	if(print) pr_warn("img_async_progress, result %d\n", img_request->result);
+
 	if (img_request->result) {
 		mutex_lock(&op->mutex);
 		op->result = img_request->result;
 		mutex_unlock(&op->mutex);
 	}
 	rbd_img_request_put(img_request);
+	if(print) pr_warn("calling progress\n");
 	rbd_progress_async_op(op);
 }
 
@@ -5332,7 +5366,7 @@ static int rbd_trim_clean_boundary(struct rbd_device *rbd_dev, u64 offset,
 		goto out;
 
 out:
-	dout("%s returned %d\n", __func__, ret);
+	pr_warn("%s returned %d\n", __func__, ret);
 	return ret;
 }
 
@@ -5345,7 +5379,7 @@ static void rbd_trim_remove_object(struct work_struct *work)
 	int ret;
 	u64 byte;
 	u64 step;
-	u64 trim_len;
+	u64 trim_len = 0;
 
 	trim_work = container_of(work, struct rbd_async_work, work);
 	op = trim_work->op;
@@ -5368,8 +5402,8 @@ static void rbd_trim_remove_object(struct work_struct *work)
 	}
 	mutex_unlock(&op->mutex);
 
-	dout("%s: byte %llu step %llu byte %% step %llu\n",
-	     __func__, byte, step, byte % step);
+	dout("%s: byte %llu step %llu byte %% step %llu, trim_len %llu work %p\n",
+	     __func__, byte, step, byte % step, trim_len, work);
 
 	if (byte % step) {
 		ret = rbd_trim_clean_boundary(rbd_dev, byte, trim_len, op);
@@ -5377,8 +5411,9 @@ static void rbd_trim_remove_object(struct work_struct *work)
 		/* If ret != 0 then the request was not submitted. We
 		   have to call the progress function here to
 		   terminate the op and propagate the error. */
-		if (ret)
+		if (ret) { pr_warn("boundary clean returned %d\n", ret);
 			goto out;
+		}
 
 		return;
 	}
@@ -5391,6 +5426,10 @@ static void rbd_trim_remove_object(struct work_struct *work)
 	}
 
 	ret = rbd_obj_delete_sync(rbd_dev, object_name);
+	if (ret == -ENOENT) {
+		pr_warn("ENOENT\n");
+		ret = 0;
+	}
 	rbd_segment_name_free(object_name);
 
 out:
@@ -5409,6 +5448,7 @@ static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
 	u64 start_object;
 	u64 end_object;
 
+	//print = 1;
 	rbd_assert(new_size < rbd_dev->header.image_size);
 
 	start_object = new_size >> rbd_dev->header.obj_order;
@@ -5463,6 +5503,7 @@ static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
 
 out:
 	dout("%s, op returned %d\n", __func__, ret);
+	print = 0;
 	return ret;
 }
 

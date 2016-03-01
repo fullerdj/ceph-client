@@ -2086,10 +2086,10 @@ static void __send_linger_ping(struct ceph_osd_request *req)
 	ceph_osdc_build_request(ping_req, 0, NULL, cpu_to_le64(CEPH_NOSNAP),
 	                        NULL);
 	ceph_osdc_get_request(req);
-	ret = ceph_osdc_start_request(req->r_osdc, ping_req, false);
+	ret = __ceph_osdc_start_request(req->r_osdc, ping_req, false);
 	if (ret) {
+		__unregister_request(req->r_osdc, ping_req);
 		ceph_osdc_put_request(ping_req);
-		ceph_osdc_cancel_request(ping_req);
 	}
 }
 
@@ -2103,6 +2103,8 @@ static void handle_linger_ping(struct work_struct *work)
 	                    linger_ping_work.work);
 
 	dout("scanning for watches to ping about\n");
+	down_read(&osdc->map_sem);
+	mutex_lock(&osdc->request_mutex);
 
 	list_for_each_entry_safe(req, nreq, &osdc->req_linger, r_linger_item) {
 		int i;
@@ -2111,6 +2113,8 @@ static void handle_linger_ping(struct work_struct *work)
 				__send_linger_ping(req);
 		}
 	}
+	mutex_unlock(&osdc->request_mutex);
+	up_read(&osdc->map_sem);
 	schedule_delayed_work(&osdc->linger_ping_work,
 	                      osdc->client->options->osd_keepalive_timeout);
 }
@@ -2693,11 +2697,16 @@ bad:
  *
  * These callbacks are used both for watch and notify operations.
  */
+/* XXX */ static void __remove_event(struct ceph_osd_event *);
 static void __release_event(struct kref *kref)
 {
 	struct ceph_osd_event *event =
 		container_of(kref, struct ceph_osd_event, kref);
+	struct ceph_osd_client *osdc = event->osdc;
 
+	mutex_lock(&osdc->event_mutex);
+	__remove_event(event);
+	mutex_unlock(&osdc->event_mutex);
 	dout("__release_event %p\n", event);
 	kfree(event);
 }
@@ -2762,7 +2771,6 @@ static void __remove_event(struct ceph_osd_event *event)
 	if (!RB_EMPTY_NODE(&event->node)) {
 		dout("__remove_event removed %p\n", event);
 		rb_erase(&event->node, &osdc->event_tree);
-		ceph_osdc_put_event(event);
 	} else {
 		dout("__remove_event didn't remove %p\n", event);
 	}
@@ -2783,7 +2791,9 @@ static struct ceph_osd_event *__alloc_event(struct ceph_osd_client *osdc,
 	event->osd_req = NULL;
 	RB_CLEAR_NODE(&event->node);
 	kref_init(&event->kref);   /* one ref for us */
+	#if 0
 	kref_get(&event->kref);    /* one ref for the caller */
+	#endif
 
 	return event;
 }
@@ -2833,10 +2843,12 @@ int ceph_osdc_create_notify_event(struct ceph_osd_client *osdc,
 }
 EXPORT_SYMBOL(ceph_osdc_create_notify_event);
 
-void ceph_osdc_wait_event(struct ceph_osd_client *osdc,
-                          struct ceph_osd_event *event)
+unsigned long ceph_osdc_wait_event(struct ceph_osd_client *osdc,
+				   struct ceph_osd_event *event)
 {
-	wait_for_completion(&event->notify.complete);
+	unsigned long timeout = osdc->client->options->mount_timeout;
+	return wait_for_completion_timeout(&event->notify.complete,
+					   ceph_timeout_jiffies(timeout));
 }
 EXPORT_SYMBOL(ceph_osdc_wait_event);
 
@@ -2844,10 +2856,12 @@ void ceph_osdc_cancel_event(struct ceph_osd_event *event)
 {
 	struct ceph_osd_client *osdc = event->osdc;
 
+	/*
 	dout("cancel_event %p\n", event);
 	mutex_lock(&osdc->event_mutex);
 	__remove_event(event);
 	mutex_unlock(&osdc->event_mutex);
+	*/
 	ceph_osdc_put_event(event); /* caller's */
 }
 EXPORT_SYMBOL(ceph_osdc_cancel_event);
@@ -2924,7 +2938,6 @@ static void __do_event(struct ceph_osd_client *osdc, u8 opcode,
 			if (event) {
 				if (event->notify.notify_id &&
 				    event->notify.notify_id != notify_id) {
-
 					ceph_osdc_put_event(event);
 					return;
 				}
@@ -2936,6 +2949,7 @@ static void __do_event(struct ceph_osd_client *osdc, u8 opcode,
 					event->osd_req = NULL;
 				}
 				complete_all(&event->notify.complete);
+				ceph_osdc_put_event(event);
 			}
 			break;
 		default:

@@ -452,8 +452,8 @@ extern int ceph_osdc_create_watch_event(struct ceph_osd_client *osdc,
                          void *data, struct ceph_osd_event **pevent);
 extern int ceph_osdc_create_notify_event(struct ceph_osd_client *osdc,
                                          struct ceph_osd_event **pevent);
-extern void ceph_osdc_wait_event(struct ceph_osd_client *osdc,
-				struct ceph_osd_event *event);
+extern unsigned long ceph_osdc_wait_event(struct ceph_osd_client *osdc,
+					  struct ceph_osd_event *event);
 extern void ceph_osdc_cancel_event(struct ceph_osd_event *event);
 extern void ceph_osdc_put_event(struct ceph_osd_event *event);
 #endif
