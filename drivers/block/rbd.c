@@ -617,6 +617,8 @@ static int rbd_handle_flatten(struct rbd_device *rbd_dev,
 			      void *start, void *end);
 static int rbd_handle_rebuild_object_map(struct rbd_device *rbd_dev,
 					 void *start, void *end);
+static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
+			  u64 request_id, u64 new_size);
 
 static int rbd_open(struct block_device *bdev, fmode_t mode)
 {
@@ -3849,6 +3851,7 @@ err:
 static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
 {
 	u64 size, gid, handle, request_id;
+	u64 old_size;
 	struct page *req_data;
 	size_t req_len = sizeof(size);
 	void *p;
@@ -3873,12 +3876,6 @@ static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
 	dout("got resize: size %llu gid %llu handle %llu request_id %llu\n",
 	     size, gid, handle, request_id);
 
-	/* can't shrink yet */
-	if (size < rbd_dev->mapping.size) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
-
 	req_data = alloc_page(GFP_NOIO);
 	if (!req_data)
 		return -ENOMEM;
@@ -3893,6 +3890,19 @@ static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
 				 &req_data, req_len, NULL, 0);
 	if (ret)
 		goto out;
+
+	down_read(&rbd_dev->header_rwsem);
+	old_size = rbd_dev->header.image_size;
+	up_read(&rbd_dev->header_rwsem);
+
+	if (size < old_size) {
+		dout("shrink from %llu to %llu\n", old_size, size);
+		ret = rbd_async_trim(rbd_dev, gid, handle, request_id, size);
+		if (ret) {
+			rbd_warn(rbd_dev, "error %d trimming image", ret);
+			goto out;
+		}
+	}
 
 	if (rbd_use_object_map(rbd_dev)) {
 		ret = rbd_object_map_resize(rbd_dev, size);
@@ -5071,6 +5081,175 @@ static int rbd_remove_child(struct rbd_device *rbd_dev,
 
 out:
 	__free_page(req_data);
+	return ret;
+}
+
+static int rbd_trim_clean_boundary(struct rbd_device *rbd_dev, u64 offset,
+				   u64 len, struct rbd_async_op *op)
+{
+	struct rbd_img_request *img_request;
+	int ret;
+
+	dout("%s %llu %llu\n", __func__, offset, len);
+
+	img_request = rbd_img_request_create(rbd_dev, offset, len,
+					     OBJ_OP_DISCARD,
+					     rbd_dev->header.snapc);
+	if (!img_request) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = rbd_img_request_fill(img_request, OBJ_REQUEST_NODATA, NULL);
+	if (ret)
+		goto out;
+
+	ceph_get_snap_context(rbd_dev->header.snapc);
+	img_request->async_op = op;
+	img_request->callback = rbd_img_async_progress;
+
+	ret = rbd_img_request_submit(img_request);
+
+	if (ret)
+		goto out;
+
+out:
+	dout("%s returned %d\n", __func__, ret);
+	return ret;
+}
+
+static void rbd_trim_remove_object(struct work_struct *work)
+{
+	struct rbd_async_work *trim_work;
+	struct rbd_async_op *op;
+	struct rbd_device *rbd_dev;
+	const char *object_name;
+	int ret;
+	u64 byte;
+	u64 step;
+	u64 image_size;
+	u64 trim_len = 0;
+
+	trim_work = container_of(work, struct rbd_async_work, work);
+	op = trim_work->op;
+	kfree(trim_work);
+
+	rbd_dev = op->rbd_dev;
+
+	down_read(&rbd_dev->header_rwsem);
+	step = rbd_obj_bytes(&rbd_dev->header);
+	image_size = rbd_dev->header.image_size;
+	up_read(&rbd_dev->header_rwsem);
+
+	mutex_lock(&op->mutex);
+	byte = op->cur_byte;
+	if (byte % step)  {
+		trim_len = min_t(u64, (step - (byte % step)),
+				 (image_size - byte));
+		op->cur_byte += trim_len;
+	} else {
+		op->cur_byte += step;
+	}
+	mutex_unlock(&op->mutex);
+
+	dout("%s: byte %llu step %llu byte %% step %llu, trim_len %llu work %p\n",
+	     __func__, byte, step, byte % step, trim_len, work);
+
+	if (byte % step) {
+		ret = rbd_trim_clean_boundary(rbd_dev, byte, trim_len, op);
+
+		/* If ret != 0 then the request was not submitted. We
+		 * have to call the progress function here to
+		 * terminate the op and propagate the error. */
+		if (ret)
+			goto out;
+
+		return;
+	}
+
+	object_name = rbd_segment_name(rbd_dev, byte);
+
+	if (!object_name) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = rbd_obj_delete_sync(rbd_dev, object_name);
+	rbd_segment_name_free(object_name);
+
+out:
+	mutex_lock(&op->mutex);
+	op->result = ret;
+	mutex_unlock(&op->mutex);
+	rbd_progress_async_op(op);
+}
+
+static int rbd_async_trim(struct rbd_device *rbd_dev, u64 gid, u64 handle,
+			  u64 request_id, u64 new_size)
+{
+	struct rbd_async_op *op;
+	int ret = 0;
+	u64 start_object;
+	u64 end_object;
+	u64 image_size;
+
+	down_read(&rbd_dev->header_rwsem);
+	image_size = rbd_dev->header.image_size;
+	up_read(&rbd_dev->header_rwsem);
+
+	rbd_assert(new_size < image_size);
+
+	start_object = new_size >> rbd_dev->header.obj_order;
+	end_object = (image_size - 1) >> rbd_dev->header.obj_order;
+
+	dout("delete %llu/%llu - %llu/%llu\n",
+	     new_size, start_object, image_size, end_object);
+
+	/* This will mark the first object as PENDING even though it may
+	 * only be partially zeroed. It will be marked RBD_OBJECT_EXISTS in
+	 * the write flow, then the guard below will avoid marking it
+	 * RBD_OBJECT_NONEXISTENT.
+	 */
+	if (rbd_use_object_map(rbd_dev)) {
+		ret = rbd_do_object_map_update(rbd_dev,
+					       start_object, end_object + 1,
+					       false, 0, RBD_OBJECT_PENDING);
+		if (ret)
+			goto out;
+	}
+
+	op = rbd_start_async_op(rbd_dev, new_size, image_size,
+				gid, handle, request_id,
+				rbd_trim_remove_object);
+	if (IS_ERR(op)) {
+		if (PTR_ERR(op) == -EPERM || PTR_ERR(op) == -EEXIST)
+			return 0;
+		return PTR_ERR(op);
+	}
+
+	ret = wait_for_completion_interruptible(&op->done);
+
+	if (ret)
+		goto out;
+
+	down_write(&rbd_dev->lock_rwsem);
+	list_del(&op->ops_entry);
+	ret = op->result;
+	up_write(&rbd_dev->lock_rwsem);
+
+	kref_put(&op->kref, __release_async_op);
+
+	if (ret)
+		goto out;
+
+	if (rbd_use_object_map(rbd_dev))
+		ret = rbd_do_object_map_update(rbd_dev,
+					       start_object, end_object + 1,
+					       true, RBD_OBJECT_PENDING,
+					       RBD_OBJECT_NONEXISTENT);
+
+out:
+	dout("%s, op returned %d\n", __func__, ret);
 	return ret;
 }
 
