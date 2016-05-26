@@ -4110,7 +4110,7 @@ int ceph_osdc_init(struct ceph_osd_client *osdc, struct ceph_client *client)
 		goto out_msgpool;
 
 	err = -ENOMEM;
-	osdc->notify_wq = create_singlethread_workqueue("ceph-watch-notify");
+	osdc->notify_wq = alloc_workqueue("ceph-watch-notify", WQ_UNBOUND, 0);
 	if (!osdc->notify_wq)
 		goto out_msgpool_reply;
 
