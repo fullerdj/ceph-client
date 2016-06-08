@@ -363,8 +363,12 @@ struct rbd_device {
 	struct ceph_file_layout	layout;
 
 	struct ceph_osd_linger_request *watch_handle;
+	struct mutex		watch_mutex;
+
 	enum rbd_lock_state	lock_state;
+	struct delayed_work	watch_retry_work;
 	struct rw_semaphore	lock_rwsem;
+	struct completion	*lock_released;
 
 	struct rbd_spec		*parent_spec;
 	u64			parent_overlap;
@@ -3114,8 +3118,17 @@ static int rbd_async_notify_ack(struct rbd_device *rbd_dev, u64 notify_id,
 {
 	void *reply_buf = NULL;
 	void *p;
+	u64 linger_id;
 	u32 reply_len = 0;
 	int ret;
+
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
+		return -ENOTCONN;
+	}
+	linger_id = rbd_dev->watch_handle->linger_id;
+	mutex_unlock(&rbd_dev->watch_mutex);
 
 	if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED) {
 		reply_len = CEPH_ENCODING_START_BLK_LEN + sizeof(reply);
@@ -3130,8 +3143,7 @@ static int rbd_async_notify_ack(struct rbd_device *rbd_dev, u64 notify_id,
 
 	ret = ceph_osdc_notify_ack(&rbd_dev->rbd_client->client->osdc,
 				   &rbd_dev->header_oid,
-				   &rbd_dev->header_oloc, notify_id,
-				   rbd_dev->watch_handle->linger_id,
+				   &rbd_dev->header_oloc, notify_id, linger_id,
 				   reply_buf, reply_len);
 	kfree(reply_buf);
 
@@ -3178,7 +3190,15 @@ static int rbd_notify_op(struct rbd_device *rbd_dev, enum rbd_notify_op op)
 	void *p;
 	int ret;
 	u64 gid = rbd_dev->rbd_client->client->msgr.inst.name.num;
-	u64 handle = rbd_dev->watch_handle->linger_id;
+	u64 handle;
+
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
+		return -ENOTCONN;
+	}
+	handle = rbd_dev->watch_handle->linger_id;
+	mutex_unlock(&rbd_dev->watch_mutex);
 
 	/*
 	 * ClientId cid
@@ -3208,10 +3228,19 @@ static int rbd_notify_op(struct rbd_device *rbd_dev, enum rbd_notify_op op)
 static int rbd_handle_acquired_lock(struct rbd_device *rbd_dev, void *start,
 				    void *end)
 {
+	u64 linger_id;
 	u64 gid;
 	u64 handle;
 	void *p;
 	int ret;
+
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
+		return -ENOTCONN;
+	}
+	linger_id = rbd_dev->watch_handle->linger_id;
+	mutex_unlock(&rbd_dev->watch_mutex);
 
 	down_write(&rbd_dev->lock_rwsem);
 
@@ -3226,7 +3255,7 @@ static int rbd_handle_acquired_lock(struct rbd_device *rbd_dev, void *start,
 	ceph_decode_64_safe(&p, end, handle, out);
 
 	if (gid != rbd_dev->rbd_client->client->msgr.inst.name.num &&
-	    handle != rbd_dev->watch_handle->linger_id) {
+	    handle != linger_id) {
 		rbd_dev->lock_state = RBD_LOCK_STATE_NOT_LOCKED;
 		rbd_warn(rbd_dev, "another client locked this image!");
 		ret = -EDEADLK;
@@ -3241,18 +3270,27 @@ out:
 static int rbd_handle_request_lock(struct rbd_device *rbd_dev, void *start,
 				   void *end)
 {
+	u64 linger_id;
 	u64 gid;
 	u64 handle;
 	void *p;
 	int ret;
 	enum rbd_lock_state state;
 
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
+		return -ENOTCONN;
+	}
+	linger_id = rbd_dev->watch_handle->linger_id;
+	mutex_unlock(&rbd_dev->watch_mutex);
+
 	p = start;
 	ceph_decode_64_safe(&p, end, gid, err);
 	ceph_decode_64_safe(&p, end, handle, err);
 
 	if (gid == rbd_dev->rbd_client->client->msgr.inst.name.num &&
-	    handle == rbd_dev->watch_handle->linger_id)
+	    handle == linger_id)
 		return 0;
 
 	down_read(&rbd_dev->lock_rwsem);
@@ -3304,6 +3342,10 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 		break;
 	case RBD_NOTIFY_OP_RELEASED_LOCK:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		spin_lock(&rbd_dev->lock);
+		if (rbd_dev->lock_released)
+			complete(rbd_dev->lock_released);
+		spin_unlock(&rbd_dev->lock);
 		break;
 	case RBD_NOTIFY_OP_REQUEST_LOCK:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
@@ -3337,19 +3379,35 @@ static void rbd_watch_errcb(void *arg, u64 cookie, int err)
 	struct rbd_device *rbd_dev = arg;
 	int ret;
 
-	rbd_warn(rbd_dev, "encountered watch error: %d", err);
+	if (err)
+		rbd_warn(rbd_dev, "encountered watch error: %d", err);
 
 	__rbd_dev_header_unwatch_sync(rbd_dev);
 
 	ret = rbd_dev_header_watch_sync(rbd_dev);
 	if (ret) {
-		rbd_warn(rbd_dev, "failed to reregister watch: %d", ret);
+		if (err)
+			rbd_warn(rbd_dev, "failed to reregister watch: %d",
+				 ret);
+		if (test_bit(RBD_DEV_FLAG_REMOVING, &rbd_dev->flags))
+			return;
+		queue_delayed_work(rbd_wq, &rbd_dev->watch_retry_work,
+				   msecs_to_jiffies(1000));
 		return;
-	}
+	} else
+		rbd_warn(rbd_dev, "reregistration of watch successful\n");
 
 	ret = rbd_dev_refresh(rbd_dev);
 	if (ret)
 		rbd_warn(rbd_dev, "reregisteration refresh failed: %d", ret);
+}
+
+static void rbd_watch_retry(struct work_struct *work)
+{
+	struct rbd_device *rbd_dev =
+			container_of(work, struct rbd_device,
+				     watch_retry_work.work);
+	rbd_watch_errcb(rbd_dev, 0, 0);
 }
 
 /*
@@ -3368,7 +3426,9 @@ static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev)
 	if (IS_ERR(handle))
 		return PTR_ERR(handle);
 
+	mutex_lock(&rbd_dev->watch_mutex);
 	rbd_dev->watch_handle = handle;
+	mutex_unlock(&rbd_dev->watch_mutex);
 	return 0;
 }
 
@@ -3377,14 +3437,18 @@ static void __rbd_dev_header_unwatch_sync(struct rbd_device *rbd_dev)
 	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
 	int ret;
 
-	if (!rbd_dev->watch_handle)
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
 		return;
+	}
 
 	ret = ceph_osdc_unwatch(osdc, rbd_dev->watch_handle);
 	if (ret)
 		rbd_warn(rbd_dev, "failed to unwatch: %d", ret);
 
 	rbd_dev->watch_handle = NULL;
+	mutex_unlock(&rbd_dev->watch_mutex);
 }
 
 /*
@@ -3497,6 +3561,20 @@ static void rbd_queue_workfn(struct work_struct *work)
 	u64 mapping_size;
 	bool notlocked;
 	int result;
+
+	/*
+	 * if we have the lock, it could be taken from us while we
+	 * are not able to get notify requests. Try to make sure
+	 * no new IO is queued until we can reregister the watch
+	 * and retry grabbing the lock.
+	 *
+	 * TODO: flush/abort requests that have not been put on the
+	 * wire. This will be done with the next patches.
+	 */
+        down_write(&rbd_dev->lock_rwsem);
+        rbd_dev->lock_state = RBD_LOCK_STATE_NOT_LOCKED;
+        up_write(&rbd_dev->lock_rwsem);
+
 
 	if (rq->cmd_type != REQ_TYPE_FS) {
 		dout("%s: non-fs request type %d\n", __func__,
@@ -4210,6 +4288,7 @@ static struct rbd_device *rbd_dev_create(struct rbd_client *rbdc,
 
 	rbd_dev = kzalloc(sizeof (*rbd_dev), GFP_KERNEL);
 	if (!rbd_dev)
+	INIT_DELAYED_WORK(&rbd_dev->watch_retry_work, rbd_watch_retry);
 		return NULL;
 
 	spin_lock_init(&rbd_dev->lock);
@@ -4217,6 +4296,7 @@ static struct rbd_device *rbd_dev_create(struct rbd_client *rbdc,
 	atomic_set(&rbd_dev->parent_ref, 0);
 	INIT_LIST_HEAD(&rbd_dev->node);
 	init_rwsem(&rbd_dev->header_rwsem);
+	mutex_init(&rbd_dev->watch_mutex);
 
 	ceph_oid_init(&rbd_dev->header_oid);
 	ceph_oloc_init(&rbd_dev->header_oloc);
@@ -5544,8 +5624,14 @@ static int rbd_lock(struct rbd_device *rbd_dev)
 
 	WARN_ON(rbd_dev->lock_state != RBD_LOCK_STATE_NOT_LOCKED);
 
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
+		return -ENOTCONN;
+	}
 	cookie = kasprintf(GFP_NOIO, "%s %llu", RBD_LOCK_COOKIE_PREFIX,
 			   rbd_dev->watch_handle->linger_id);
+	mutex_unlock(&rbd_dev->watch_mutex);
 	if (!cookie)
 		return -ENOMEM;
 
@@ -5603,6 +5689,7 @@ out:
 
 static int rbd_try_lock(struct rbd_device *rbd_dev)
 {
+	DECLARE_COMPLETION_ONSTACK(release_wait);
 	int num_lockers = 0;
 	struct ceph_locker *lockers;
 	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
@@ -5669,9 +5756,21 @@ start:
 					  lockers[0].id.cookie);
 		goto start;
 	} else {
+		spin_lock(&rbd_dev->lock);
+		reinit_completion(&release_wait);
+		rbd_dev->lock_released = &release_wait;
+		spin_unlock(&rbd_dev->lock);
+
 		ret = rbd_notify_op(rbd_dev, RBD_NOTIFY_OP_REQUEST_LOCK);
-		if (ret == -ETIMEDOUT)
+		if (ret == -ETIMEDOUT) {
 			rbd_warn(rbd_dev, "no response from lock owner");
+		} else {
+			wait_for_completion_timeout(rbd_dev->lock_released,
+						    msecs_to_jiffies(3000));	
+			spin_lock(&rbd_dev->lock);
+			rbd_dev->lock_released = NULL;
+			spin_unlock(&rbd_dev->lock);
+		}
 		goto start;
 	}
 
@@ -5688,14 +5787,29 @@ static int rbd_unlock(struct rbd_device *rbd_dev)
 {
 	int ret;
 	char *cookie;
+	u64 linger_id;
 
-	cookie = kasprintf(GFP_NOIO, "%s %llu", RBD_LOCK_COOKIE_PREFIX,
-			   rbd_dev->watch_handle->linger_id);
-
-	if (!cookie)
-		return -ENOMEM;
+	mutex_lock(&rbd_dev->watch_mutex);
+	if (!rbd_dev->watch_handle) {
+		mutex_unlock(&rbd_dev->watch_mutex);
+		return -ENOTCONN;
+	}
+	linger_id = rbd_dev->watch_handle->linger_id;
+	mutex_unlock(&rbd_dev->watch_mutex);
 
 	down_write(&rbd_dev->lock_rwsem);
+	if (rbd_dev->lock_state == RBD_LOCK_STATE_NOT_LOCKED) {
+		ret = 0;
+		goto unlock;
+	}
+
+	cookie = kasprintf(GFP_NOIO, "%s %llu", RBD_LOCK_COOKIE_PREFIX,
+			   linger_id);
+	if (!cookie) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
 	ceph_osdc_sync(&rbd_dev->rbd_client->client->osdc);
 	ret = ceph_cls_unlock(&rbd_dev->rbd_client->client->osdc,
 			      rbd_dev->spec->pool_id, rbd_dev->header_oid.name,
@@ -5710,6 +5824,7 @@ static int rbd_unlock(struct rbd_device *rbd_dev)
 	}
 
 	kfree(cookie);
+unlock:
 	up_write(&rbd_dev->lock_rwsem);
 	return ret;
 }
@@ -5795,11 +5910,8 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 		 * rbd_dev_image_release() without refactoring, see
 		 * commit 1f3ef78861ac.
 		 */
-		if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED) {
-			down_write(&rbd_dev->lock_rwsem);
+		if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED)
 			rbd_unlock(rbd_dev);
-			up_write(&rbd_dev->lock_rwsem);
-		}
 		rbd_dev_header_unwatch_sync(rbd_dev);
 		rbd_dev_image_release(rbd_dev);
 		goto out;
@@ -5916,6 +6028,8 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 	spin_unlock(&rbd_dev_list_lock);
 	if (ret < 0 || already)
 		return ret;
+
+	cancel_delayed_work_sync(&rbd_dev->watch_retry_work);
 
 	if (rbd_dev->lock_state == RBD_LOCK_STATE_LOCKED)
 		rbd_unlock(rbd_dev);
