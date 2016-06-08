@@ -3205,6 +3205,50 @@ static int rbd_notify_op(struct rbd_device *rbd_dev, enum rbd_notify_op op)
 	return ret;
 }
 
+static int rbd_notify_async_complete(struct rbd_device *rbd_dev, u64 gid,
+				     u64 handle, u64 request_id, int result)
+{
+	void *reply;
+	u32 message_len;
+	void *p;
+	int ret;
+
+	/*
+	 * AsyncRequestId id
+	 * {
+	 *     ClientId cid
+	 *     {
+	 *         u64 gid
+	 *         u64 handle
+	 *     }
+	 *     u64 request_id
+	 * }
+	 * int result
+	 */
+
+	dout("%s result %d\n", __func__, result);
+	message_len = sizeof(u32) + sizeof(gid) + sizeof(handle) +
+		sizeof(request_id) + sizeof(result);
+
+	reply = kmalloc(message_len, GFP_NOIO);
+	if (!reply)
+		return -ENOMEM;
+
+	p = reply;
+
+	ceph_encode_32(&p, RBD_NOTIFY_OP_ASYNC_COMPLETE);
+	ceph_encode_64(&p, gid);
+	ceph_encode_64(&p, handle);
+	ceph_encode_64(&p, request_id);
+	ceph_encode_32(&p, result);
+
+	ret = rbd_proxy_notify(rbd_dev, reply, message_len);
+
+	dout("%s notify completed, ret %d\n", __func__, ret);
+	kfree(reply);
+	return ret;
+}
+
 static int rbd_handle_acquired_lock(struct rbd_device *rbd_dev, void *start,
 				    void *end)
 {
@@ -3268,6 +3312,69 @@ err:
 	return -ERANGE;
 }
 
+static int rbd_handle_resize(struct rbd_device *rbd_dev, void *start, void *end)
+{
+	u64 size, gid, handle, request_id;
+	struct page *req_data;
+	size_t req_len = sizeof(size);
+	void *p;
+	int ret;
+	enum rbd_lock_state state;
+
+	down_read(&rbd_dev->lock_rwsem);
+	state = rbd_dev->lock_state;
+	up_read(&rbd_dev->lock_rwsem);
+
+	if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED) {
+		dout("%s skipping resize\n", __func__);
+		return 0;
+	}
+
+	p = start;
+	ceph_decode_64_safe(&p, end, size, err);
+	ceph_decode_64_safe(&p, end, gid, err);
+	ceph_decode_64_safe(&p, end, handle, err);
+	ceph_decode_64_safe(&p, end, request_id, err);
+
+	dout("got resize: size %llu gid %llu handle %llu request_id %llu\n",
+	     size, gid, handle, request_id);
+
+	/* can't shrink yet */
+	if (size < rbd_dev->mapping.size) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	req_data = alloc_page(GFP_NOIO);
+	if (!req_data)
+		return -ENOMEM;
+
+	p = page_address(req_data);
+	ceph_encode_64(&p, size);
+
+	ret = ceph_osdc_cls_call(&rbd_dev->rbd_client->client->osdc,
+				 rbd_dev->spec->pool_id,
+				 rbd_dev->header_oid.name, "rbd", "set_size",
+				 CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_ONDISK,
+				 &req_data, req_len, NULL, 0);
+	if (ret)
+		goto out;
+
+	ret = rbd_dev_refresh(rbd_dev);
+	if (ret)
+		goto out;
+
+	rbd_warn(rbd_dev, "resized to %llu", size);
+
+out:
+	__free_page(req_data);
+	rbd_notify_async_complete(rbd_dev, gid, handle, request_id, ret);
+	dout("%s: returned %d\n", __func__, ret);
+	return ret;
+err:
+	return -ERANGE;
+}
+
 static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 			 void *data, size_t data_len)
 {
@@ -3319,6 +3426,12 @@ static void rbd_watch_cb(void *arg, u64 notify_id, u64 cookie, u64 notifier_id,
 		break;
 	case RBD_NOTIFY_OP_ASYNC_COMPLETE:
 		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		break;
+	case RBD_NOTIFY_OP_RESIZE:
+		rbd_async_notify_ack(rbd_dev, notify_id, 0);
+		ret = rbd_handle_resize(rbd_dev, p, end);
+		if (ret)
+			rbd_warn(rbd_dev, "resize failed: %d", ret);
 		break;
 	default:
 		rbd_async_notify_ack(rbd_dev, notify_id, -ENOTSUPP);

@@ -83,6 +83,7 @@ enum rbd_notify_op {
 	RBD_NOTIFY_OP_REQUEST_LOCK       = 2,
 	RBD_NOTIFY_OP_HEADER_UPDATE      = 3,
 	RBD_NOTIFY_OP_ASYNC_COMPLETE     = 5,
+	RBD_NOTIFY_OP_RESIZE             = 7,
 };
 
 enum rbd_lock_state {
