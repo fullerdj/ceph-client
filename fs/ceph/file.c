@@ -821,6 +821,9 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 			break;
 		}
 
+		if (!write)
+			size = min_t(u64, size, fsc->mount_options->rsize);
+
 		len = iov_iter_get_pages_alloc(iter, &pages, size, &start);
 		if (len < 0) {
 			ceph_osdc_put_request(req);
